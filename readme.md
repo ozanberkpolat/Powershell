@@ -65,12 +65,8 @@ Ensure necessary permissions and context (e.g., `Connect-AzAccount`, `Connect-Mg
 
 ---
 
-## 🧾 License
-
-MIT License. See [LICENSE](../LICENSE) for details.
-
----
 
 ## ✍️ Author
 
-Maintained by [ozanberkplt](https://github.com/ozanberkplt)
+Maintained by [ozanberkpolat](https://github.com/ozanberkpolat)
+
