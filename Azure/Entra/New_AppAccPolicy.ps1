@@ -1,9 +1,9 @@
 # Variables
-$AppID = "f0468c66-1847-4f52-958b-d3609ba5e9e5"  # Replace with your actual Application ID
-$GroupName = "AGRP-ALL-AppAccPolicy-CLMTestUS"
-$GroupAlias = "CLMTestUS-SecGrp"
-$Description = "grants access to clm-hou-test@gunvorgroup.com"
-$Mailboxes = @("clm-hou-test@gunvorgroup.com")  # Add more as needed
+$AppID = "CLIENT-ID"  # Replace with your actual Application ID
+$GroupName = "APP-ACCESS-POLCY-GROUP-NAME"
+$GroupAlias = "APP-SecGrp"
+$Description = "grants access to MAILBOX-NAME"
+$Mailboxes = @("MAILBOX")  # Add more as needed
  
 # Connect to Exchange Online (if not already connected)
 Connect-ExchangeOnline
@@ -22,8 +22,8 @@ New-ApplicationAccessPolicy -AppId $AppID -PolicyScopeGroupId $PolicyScopeGroupI
  
  
 # Step 5: TEST
-$Identity = "clm-hou-test@gunvorgroup.com"  # Replace with the identity you want to test
-$Identity2 = "ozan.polat@gunvorgroup.com"  # Replace with another identity to test
+$Identity = "MAILBOX"  # Replace with the identity you want to test
+$Identity2 = "ozan.polat@company.com"  # Replace with another identity to test
 Test-ApplicationAccessPolicy -Identity $Identity -AppId $AppID
 Test-ApplicationAccessPolicy -Identity $Identity2 -AppId $AppID 
 Get-ApplicationAccessPolicy
