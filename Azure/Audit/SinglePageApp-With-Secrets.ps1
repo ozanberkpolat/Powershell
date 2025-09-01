@@ -1,39 +1,36 @@
 <#
 .SYNOPSIS
-    Audit SPA (Single Page Application) App Registrations for client secrets.
+    Audit SPA (Single Page Application) App Registrations for client secrets and capture internal notes for owners.
 
 .DESCRIPTION
     This script connects to Microsoft Graph and retrieves all App Registrations
     in the tenant. It identifies apps configured as SPA (Single Page Application)
     and checks if they contain any **active** client secrets (PasswordCredentials).
     
-    SPAs are public clients and should not have secrets assigned. 
-    If any are found, they are flagged and exported.
-
-    Expired secrets are ignored.
+    SPAs are public clients and should not hold secrets. Expired secrets are ignored.
+    Additionally, it extracts the Owner information from the app's internal notes (Notes field).
 
 .REQUIREMENTS
     - PowerShell 5.1+ or PowerShell Core 7+
     - Microsoft.Graph PowerShell SDK
       Install with: Install-Module Microsoft.Graph -Scope CurrentUser
-    - Permissions: Application.Read.All and Directory.Read.All
+    - Permissions: Application.Read.All, Directory.Read.All
 
 .OUTPUTS
     CSV file containing:
         - App Name
         - App ID
-        - Created Date
         - Redirect URIs
-        - Secret Key ID
         - Secret Start Date
         - Secret End Date
+        - Owner
 
 .NOTES
     Author: OBP + ChatGPT
-    Date:   2025-08-29
+    Date:   2025-09-01
 #>
 
-# Connect to Microsoft Graph with required permissions
+# Connect to Microsoft Graph
 Connect-MgGraph -Scopes "Application.Read.All","Directory.Read.All"
 
 # Ensure output folder exists
@@ -42,29 +39,39 @@ if (-not (Test-Path $OutputFolder)) {
     New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
 }
 
-$OutputFile = Join-Path $OutputFolder "SPA_Apps_WithSecrets.csv"
+# Add timestamp for output filename
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$OutputFile = Join-Path $OutputFolder "SPA_Apps_WithSecrets_$timestamp.csv"
 $now = Get-Date
 
-# Get all applications (include createdDateTime)
-$apps = Get-MgApplication -All -Property "id,displayName,appId,createdDateTime,spa,passwordCredentials"
+# Get all applications including necessary properties
+$apps = Get-MgApplication -All -Property "id,displayName,appId,spa,passwordCredentials,notes"
 
 $results = @()
 
 foreach ($app in $apps) {
-    # Check if app is a SPA (has RedirectUris under spa property)
+    # Check if app is SPA
     if ($app.Spa -and $app.Spa.RedirectUris.Count -gt 0) {
-        # Check if active secrets exist
+        # Extract Owner info from Notes
+        $owner = $null
+        if ($app.Notes) {
+            # Assuming the format contains "Owner: <name>" somewhere
+            if ($app.Notes -match "Owner:\s*(.+)") {
+                $owner = $matches[1].Trim()
+            }
+        }
+
+        # Check for active secrets
         foreach ($secret in $app.PasswordCredentials) {
             if ($null -ne $secret.StartDateTime -and $null -ne $secret.EndDateTime) {
                 if ($secret.EndDateTime -gt $now) {
                     $results += [PSCustomObject]@{
                         AppName      = $app.DisplayName
                         AppId        = $app.AppId
-                        CreatedDate  = $app.CreatedDateTime
                         RedirectURIs = ($app.Spa.RedirectUris -join "; ")
-                        SecretKeyId  = $secret.KeyId
                         StartDate    = $secret.StartDateTime
                         EndDate      = $secret.EndDateTime
+                        Owner        = $owner
                     }
                 }
             }
