@@ -28,5 +28,8 @@ $filteredApps = $appRegistrations | Where-Object {
 Write-Host "`n=== Matching App Registrations (excluding 'azdo*') ==="
 $filteredApps | Select-Object Id, DisplayName, Notes | Format-Table -AutoSize
 
-# Show results
+# Export results to CSV
+$csvPath = "D:\OBP\Audit Results\AppRegistrations-Filtered.csv"
 $filteredApps | Select-Object Id, DisplayName, Notes | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nResults exported to $csvPath"
