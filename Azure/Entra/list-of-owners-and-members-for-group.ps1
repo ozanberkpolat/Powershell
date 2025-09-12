@@ -2,7 +2,7 @@
 Connect-MgGraph -Scopes "Group.Read.All", "User.Read.All", "Directory.Read.All"
 
 $allGroups = Get-MgGroup -All
-$groups = $allGroups | Where-Object { $_.DisplayName -like "AGRP-ALL-PBI*" }
+$groups = $allGroups | Where-Object { $_.DisplayName -like "AGRP-SWN-FABRIC WS*" }
 
 # Loop through each group and retrieve the owners and members
 $groupData = foreach ($group in $groups) {
