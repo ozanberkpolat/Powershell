@@ -1,3 +1,3 @@
 Import-Module Microsoft.Graph
 Connect-MgGraph -Scopes "Group.Read.All"
-Get-MgDirectoryDeletedItem -DirectoryObjectId "d37a741b-538c-432b-99c0-3eda20f6e19e"
+Get-MgGroup -GroupId "0aa62520-5c37-4fc1-bcc5-b0eb4a19c45d" | Select-Object DisplayName, Id, Mail, MailEnabled, SecurityEnabled
