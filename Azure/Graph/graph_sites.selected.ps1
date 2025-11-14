@@ -59,3 +59,24 @@ Import-Module Microsoft.Graph.Sites
 
 Connect-MgGraph -Scope Sites.FullControl.All
 New-MgSitePermission -SiteId $spoSiteId -Roles $appRole -GrantedToIdentities @{ Application = $application }
+
+Write-Host "Permission assignment completed for site: $spoSite"
+
+
+$perms = Get-MgSitePermission -SiteId $spoSiteId
+
+foreach ($p in $perms) {
+    foreach ($id in $p.grantedToIdentities) {
+
+        if ($id.application -ne $null) {
+            $appId = $id.application.id
+            $sp = Get-MgServicePrincipal -Filter "appId eq '$appId'"
+            
+            [PSCustomObject]@{
+                AppId        = $appId
+                DisplayName  = $sp.DisplayName
+                Permission   = $p.Roles -join ","
+            }
+        }
+    }
+}
