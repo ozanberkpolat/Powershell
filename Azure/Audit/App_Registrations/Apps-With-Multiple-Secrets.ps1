@@ -28,7 +28,7 @@
 Connect-MgGraph -Scopes "Application.Read.All","Directory.Read.All"
 
 # Ensure output folder exists
-$OutputFolder = "D:\OBP\Audit Results"
+$OutputFolder = "C:\OBP\Audit Results"
 if (-not (Test-Path $OutputFolder)) {
     New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
 }
