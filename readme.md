@@ -1,72 +1,94 @@
-
 # PowerShell Automation Scripts
 
-A structured collection of PowerShell scripts for automating common Azure and On-Premises tasks related to identity, access, auditing, and resource management.
+A structured collection of PowerShell scripts for automating Azure and On-Premises tasks across identity, networking, disaster recovery, backup, cost management, and more.
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
-### 🔷 Azure/
+### Azure/
 
-Scripts tailored for Microsoft Azure environments:
+| Folder | Description |
+|--------|-------------|
+| **Audit/** | Tenant audits, app registration reviews, authentication method checks, and privilege access reporting |
+| **Cost/** | Cost analysis, resource comparison, and spend breakdowns across subscriptions |
+| **Disaster-Recovery/** | ASR network mapping audits, VM failover network validation, VNet dependency checks, NSG/route table comparisons |
+| **Disk-Management/** | Snapshot creation from existing disks, disk creation from snapshots, disk attach automation |
+| **Entra ID/** | User, group, role, and policy automation for Entra ID (formerly Azure AD) |
+| **Entra_Connect/** | Utilities for Entra Connect sync troubleshooting |
+| **Graph/** | Microsoft Graph API integrations — permissions, service principals, SharePoint site access |
+| **IAM/** | Role assignments, Key Vault access policies, and secret-scoped RBAC |
+| **Integration/** | Azure Data Factory linked service inspection and version reporting |
+| **Networking/** | App Gateway listener enumeration, DNS record retrieval, private endpoint listing, network segmentation analysis |
+| **Recovery-Services_Vault/** | Backup audits, orphaned backup detection, SQL backup retention management, disabling unreachable backup items |
+| **Subscription-Management/** | Subscription-wide VM listing and resource inventory |
+| **Tagging/** | VM tag policy compliance checks and maintenance config tag management |
+| **Tools/** | Tooling integrations: Maester, Entra Exporter, Zero Trust Assessment, M365 DSC |
 
-- **Audit/**  
-  Scripts for tenant audits, activity logging, compliance checks, and environment reviews.
+### ITSM/
 
-- **Entra/**  
-  Entra ID (formerly Azure AD) automation, including user, group, role, and policy management.
+| Folder | Description |
+|--------|-------------|
+| **ITSM/** | Service management integrations — Xurrent (4me) API connectivity |
 
-- **Graph/**  
-  Microsoft Graph API integrations—token auth, data pulls, batch operations, and more.
+### Functions/
 
-- **Subscription-Management/**  
-  Manage Azure subscriptions, role assignments, policy enforcement, and budget automation.
+Azure Functions scripts for license count alerting and secret/certificate expiration monitoring.
+
+### M365/
+
+Microsoft 365 automation — license assignment reporting.
+
+### On-Prem/
+
+Active Directory user and account lifecycle management: disabling expired accounts, deleting disabled users, password expiration notifications.
 
 ---
 
-### 🖥️ On-Prem/
-
-Scripts for hybrid/on-premises infrastructure:
-
-- **Account-Management/**  
-  Manage Active Directory users, groups, and organizational units.
-
----
-
-## ⚙️ Usage
-
-Each script is standalone unless noted otherwise. You can run them directly in PowerShell 7+ or Windows PowerShell 5.1.
-
-### Example:
-```powershell
-.\Azure\Entra\Create-EntraUser.ps1 -UserPrincipalName "test@domain.com"
-```
-
-Ensure necessary permissions and context (e.g., `Connect-AzAccount`, `Connect-MgGraph`) before execution.
-
----
-
-## 🔐 Requirements
+## Requirements
 
 - PowerShell 7+ (recommended)
-- Required modules (install via `Install-Module` if needed):
-  - `Az`
-  - `Microsoft.Graph`
-  - `ActiveDirectory` (for on-prem)
+- Modules (install via `Install-Module` as needed):
+  - `Az` — for all Azure scripts
+  - `Az.RecoveryServices` — for DR and backup scripts
+  - `Microsoft.Graph` — for Graph and Entra scripts
+  - `ActiveDirectory` — for On-Prem scripts
 
 ---
 
-## ✅ Best Practices
+## Usage
 
-- Always run scripts in a test environment first.
-- Check for hardcoded values or placeholders before use.
-- Review script headers for parameter documentation.
+Most scripts are standalone. Set required environment variables before running:
+
+```powershell
+$env:AZURE_SUBSCRIPTION_ID = "<your-subscription-id>"
+$env:AZURE_SUBSCRIPTION_NAME = "<your-subscription-name>"
+```
+
+Authenticate first:
+
+```powershell
+Connect-AzAccount
+Connect-MgGraph -Scopes "..."
+```
+
+Then run any script directly:
+
+```powershell
+.\Azure\Disaster-Recovery\Check-ASRNetworkMappings.ps1 -DrRegion "germanywestcentral"
+.\Azure\Recovery-Services_Vault\Disable-NotReachableSQLBackups.ps1
+```
 
 ---
 
+## Best Practices
 
-## ✍️ Author
+- Run in a test or staging environment before production.
+- No credentials are hardcoded — all secrets are read from environment variables.
+- Review script parameters at the top of each file before executing.
+
+---
+
+## Author
 
 Maintained by [ozanberkpolat](https://github.com/ozanberkpolat)
-
