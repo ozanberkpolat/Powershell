@@ -39,6 +39,20 @@ Azure Functions scripts for license count alerting and secret/certificate expira
 
 Microsoft 365 automation — license assignment reporting.
 
+### Intune/
+
+| Path | Description |
+|------|-------------|
+| **Intune/WDAC/** | App Control for Business (WDAC) tooling for AVD and Intune: base policy builder, per-application supplemental builder, supplemental verifier, ConfigCI traps checklist (Windows PowerShell 5.1) |
+| **Intune/Build-Win32Package.ps1** | Builds a Win32 `.intunewin` with source hash and signature checks, generated install/uninstall commands and a detection stub |
+| **Intune/Get-IntuneAppControlStatus.ps1** | Read-only Graph probe of App Control policies, assignments and device group membership |
+| **Intune/Win32-Packaging.md** | Win32 delivery standard, Intune wizard values, MSI inspection steps |
+| **Intune/Templates/** | Generic MSI install and uninstall `.cmd` templates (SYSTEM context, logging) |
+
+### Zabbix/
+
+Zabbix JSON-RPC helpers and reporting/alerting scripts: host and item selection, chunked trend export, web scenario and host availability evidence, port checks and web scenario alerting. See `Zabbix/README.md`.
+
 ### On-Prem/
 
 Active Directory user and account lifecycle management: disabling expired accounts, deleting disabled users, password expiration notifications.
