@@ -25,6 +25,28 @@ A structured collection of PowerShell scripts for automating Azure and On-Premis
 | **Tagging/** | VM tag policy compliance checks and maintenance config tag management |
 | **Tools/** | Tooling integrations: Maester, Entra Exporter, Zero Trust Assessment, M365 DSC |
 
+### Azure core additions
+
+New folders `Azure/Common/`, `Azure/Compute/`, `Azure/Monitoring/`, `Azure/Storage/`, top-level `AVD/` and `GOTCHAS.md` (hard-won traps). Dot-source the helpers after `Connect-AzAccount`; every script that changes Azure supports `-WhatIf`.
+
+| Path | Description |
+|------|-------------|
+| `Azure/Common/Az-Helpers.ps1` | `Search-Graph` (Resource Graph across subscriptions, `$skipToken` paging), `Invoke-Arm` / `Invoke-ArmRequest` (ARM REST with 429/Retry-After retry and nextLink), `Invoke-LaKql` (Log Analytics query by workspace ID) |
+| `Azure/Common/Graph-Helpers.ps1` | `Get-GraphAll` (Microsoft Graph paging) |
+| `Azure/Compute/Invoke-VmRunCommand.ps1` | Run a script on many VMs (Windows/Linux), Conflict retry, parallel, protected parameters, evidence folder, exit code |
+| `Azure/Compute/Remove-StaleRunCommands.ps1` | Report and delete managed Run Command resources (25 per VM limit) |
+| `Azure/Compute/Push-InstallerViaRunCommand.ps1` | Push an installer in base64 chunks to VMs without internet, verify SHA-256, install |
+| `Azure/Recovery-Services_Vault/Invoke-RestoreTest.ps1` | Restore a backed-up VM into an isolated subnet, evidence, access checks, cleanup (`RestoreTest-Runbook.md`) |
+| `Azure/Storage/Get-StorageKeyUsage.ps1` | Who calls listKeys / generates SAS (Activity Log, 7-day slices) |
+| `Azure/Storage/Get-StorageAuthMix.ps1` | Transactions by authentication type (shared key / OAuth / SAS) before disabling shared key |
+| `Azure/Cost/Get-MonthlyCostByService.ps1` | Month-over-month cost per service / resource group / resource; supersedes `Get-AzureCostAnalysis.ps1` |
+| `Azure/Cost/Get-Reservations.ps1` | Reservations, orders, savings plans, expiry, utilization, auto-renew flag |
+| `Azure/Cost/Get-ReservationCoverage.ps1` | Reservation coverage per region x instance size flexibility group |
+| `Azure/Monitoring/Sync-AppServiceDiagnosticSettings.ps1` | Audit App Service diagnostic routing and partial categories; create/repoint settings |
+| `Azure/Graph/Grant-ManagedIdentityM365Access.ps1` | Managed identity to Graph app role, SharePoint folder/site permission, Key Vault role |
+| `M365/Set-AppMailboxScope.ps1` | Exchange Online RBAC for Applications scoped to one mailbox |
+| `AVD/Register-SessionHost.ps1`, `AVD/Test-HybridJoin.ps1`, `AVD/README.md` | Session host re-registration, hybrid join diagnosis, AVD lessons and required endpoints |
+
 ### ITSM/
 
 | Folder | Description |
