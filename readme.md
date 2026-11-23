@@ -51,12 +51,15 @@ Microsoft 365 automation — license assignment reporting.
 | **Intune/Zabbix-Agent2/** | Win32 package for Zabbix agent 2 with TLS PSK on AVD session hosts: install/uninstall `.cmd` (server and PSK identity as parameters), custom detection script |
 | **Intune/Remediation/** | Remediations script pairs: `TeamsMwi-Detect.ps1` / `TeamsMwi-Remediate.ps1` remove the classic Teams Machine-Wide Installer once new Teams is present |
 | **Intune/Test-AppInstallHealth.ps1** | Read-only post-update health test for a Win32 app: version, duplicate installs, uninstall entries, "Open with" verb, context-menu handler DLLs |
+| **Intune/Inspect-Msi.ps1** | Read-only MSI/EXE inspector: ProductCode, UpgradeCode, version, ALLUSERS, platform, SHA256, Authenticode signer chain, plus ready-made Intune detection rules |
 
 ### Zabbix/
 
 Zabbix JSON-RPC helpers and reporting/alerting scripts: host and item selection, chunked trend export, web scenario and host availability evidence, port checks and web scenario alerting. See `Zabbix/README.md`.
 
 Also: monthly utilisation and uptime bundle collector with documented scoring rules (`Zabbix/report-rules.md`), business service tree builder, host tag merge, and a tenant-scoped read-only role for the service tree.
+
+Also: `Zabbix/UserParameters/ibmmq/` (Zabbix Agent 2 UserParameter helper for IBM MQ: queue managers, queue depth, dead letter queue, channel status) and `Zabbix/Templates/` (agentless HTTP templates for Azure Logic App runs, Application Gateway backend health and Update Manager scheduled patching, service principal or managed identity).
 
 ### On-Prem/
 

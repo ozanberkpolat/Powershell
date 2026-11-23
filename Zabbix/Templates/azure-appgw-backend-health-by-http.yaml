@@ -1,0 +1,390 @@
+zabbix_export:
+  version: '6.4'
+  template_groups:
+    - uuid: 0d5f6c613b8d429fb8ddb00b9219fa4f
+      name: Templates/Azure
+  templates:
+    - uuid: 22f866594a7045a6a921eafedba9d6c1
+      template: 'Azure Application Gateway Backend Health by HTTP'
+      name: 'Azure Application Gateway Backend Health by HTTP'
+      description: |
+        Monitors the backend health of one Azure Application Gateway (Microsoft.Network/applicationGateways) by HTTP through ARM and Azure Monitor metrics. No agent, no external script.
+
+        Setup:
+          1. Create a service principal (or use the managed identity of the Azure VM that runs Zabbix, AZURE.AUTH.MODE=msi) and give it Reader on the gateway or its resource group. Reader includes Microsoft.Insights/metrics/read.
+          2. Create one host per gateway (no interface needed) and link this template.
+          3. On the HOST set AZURE.TENANT.ID, AZURE.APP.ID, AZURE.PASSWORD (secret) and AZURE.RESOURCE.ID = /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Network/applicationGateways/<name>.
+          4. Use Test on the Get data item and check the JSON and the Collector error item.
+
+        Metrics arrive 1-3 minutes late; the template reads the newest existing point and treats an empty answer as -1, never as zero.
+      groups:
+        - name: Templates/Azure
+      items:
+        - uuid: 4a97999891b04698aaf24861588f9555
+          name: 'Azure Application Gateway: Get data'
+          type: SCRIPT
+          key: azure.appgw.data.get
+          delay: 2m
+          history: '0'
+          value_type: TEXT
+          trends: '0'
+          params: |
+            // Shared auth block. Zabbix embedded JS is Duktape (ES5): no let/const, arrow functions or Array.prototype.find.
+            var P = JSON.parse(value);
+
+            function need(fields) {
+                for (var i = 0; i < fields.length; i++) {
+                    if (typeof P[fields[i]] === 'undefined' || P[fields[i]] === null || P[fields[i]] === '') {
+                        throw 'Required param is not set: ' + fields[i] + '.';
+                    }
+                }
+            }
+
+            function call(method, url, headers, body, useProxy) {
+                var r = new HttpRequest();
+                if (useProxy && P.proxy) { r.setProxy(P.proxy); }
+                for (var i = 0; i < headers.length; i++) { r.addHeader(headers[i]); }
+                var resp = (method === 'post') ? r.post(url, body) : r.get(url);
+                return { status: r.getStatus(), body: resp };
+            }
+
+            function login() {
+                var res, j;
+                if (P.auth_mode === 'msi') {
+                    // Managed identity of the Azure VM that runs Zabbix. IMDS is link-local: it must bypass the proxy.
+                    // app_id (optional) selects a user-assigned identity.
+                    res = call('get', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=' +
+                        encodeURIComponent('https://management.azure.com/') + (P.app_id ? '&client_id=' + encodeURIComponent(P.app_id) : ''),
+                        ['Metadata: true'], null, false);
+                    if (res.status !== 200) { throw 'Managed identity token request failed with status ' + res.status + ': ' + String(res.body).substring(0, 300); }
+                } else {
+                    need(['tenant_id', 'app_id', 'password']);
+                    res = call('post', 'https://login.microsoftonline.com/' + encodeURIComponent(P.tenant_id) + '/oauth2/v2.0/token',
+                        ['Content-Type: application/x-www-form-urlencoded'],
+                        'grant_type=client_credentials&client_id=' + encodeURIComponent(P.app_id) +
+                        '&client_secret=' + encodeURIComponent(P.password) +
+                        '&scope=' + encodeURIComponent('https://management.azure.com/.default'), true);
+                    if (res.status !== 200) { throw 'Login failed with status ' + res.status + ': ' + String(res.body).substring(0, 300); }
+                }
+                try { j = JSON.parse(res.body); } catch (e) { throw 'Failed to parse the login response.'; }
+                if (!j.access_token) { throw 'The login response does not contain an access token.'; }
+                return j.access_token;
+            }
+
+            function arm(token, url) {
+                // An empty or non-200 answer is an error, never "zero results".
+                var res = call('get', url, ['Content-Type: application/json', 'Authorization: Bearer ' + token], null, true);
+                if (res.status !== 200) { throw 'Request failed with status ' + res.status + ' for ' + url.split('?')[0] + ': ' + String(res.body).substring(0, 300); }
+                try { return JSON.parse(res.body); } catch (e) { throw 'Failed to parse the API response.'; }
+            }
+
+            // Application Gateway backend health from Azure Monitor metrics plus the gateway's own state.
+            // Metrics only. The per-server API (POST .../backendhealth) is a long-running operation (202 + Location poll)
+            // that a script item cannot do reliably; see the README for the per-server query.
+            try {
+                need(['resource_id']);
+                var token = login();
+                var base = 'https://management.azure.com' + P.resource_id;
+                var gw = arm(token, base + '?api-version=2023-11-01');
+                var pr = gw.properties || {};
+
+                // timespan=PT10M ends now. Average per 1-minute point; metrics arrive 1-3 minutes late, so take the
+                // newest point that exists rather than the (still empty) current minute.
+                var m = arm(token, base + '/providers/Microsoft.Insights/metrics?api-version=2024-02-01&metricnames=' +
+                    encodeURIComponent('HealthyHostCount,UnhealthyHostCount') + '&aggregation=Average&interval=PT1M&timespan=PT10M');
+                var out = { healthy: -1, unhealthy: -1, points: 0 };
+                var vals = m.value || [];
+                for (var i = 0; i < vals.length; i++) {
+                    var name = vals[i].name.value, ts = vals[i].timeseries || [], last = null;
+                    for (var s = 0; s < ts.length; s++) {
+                        var d = ts[s].data || [];
+                        for (var k = 0; k < d.length; k++) {
+                            if (typeof d[k].average === 'number') { last = d[k].average; out.points++; }
+                        }
+                    }
+                    if (last !== null) { out[name === 'HealthyHostCount' ? 'healthy' : 'unhealthy'] = last; }
+                }
+                // -1 = Azure returned no data point at all. A stopped gateway or a metrics outage must not read as "0 unhealthy".
+                return JSON.stringify({
+                    operational: pr.operationalState || 'Unknown', provisioning: pr.provisioningState || 'Unknown',
+                    sku: (pr.sku && pr.sku.name) ? pr.sku.name : '', backend_pools: (pr.backendAddressPools || []).length,
+                    healthy: out.healthy, unhealthy: out.unhealthy, points: out.points
+                });
+            }
+            catch (error) {
+                error = String(error); error += (error.charAt(error.length - 1) === '.') ? '' : '.';
+                Zabbix.log(3, '[ AzureAppGW ] ERROR: ' + error);
+                return JSON.stringify({ error: error });
+            }
+          description: 'Reads the gateway and its backend host metrics. Result is one JSON document for the dependent items.'
+          timeout: '{$AZURE.TIMEOUT}'
+          parameters:
+            - name: app_id
+              value: '{$AZURE.APP.ID}'
+            - name: auth_mode
+              value: '{$AZURE.AUTH.MODE}'
+            - name: password
+              value: '{$AZURE.PASSWORD}'
+            - name: proxy
+              value: '{$AZURE.PROXY}'
+            - name: resource_id
+              value: '{$AZURE.RESOURCE.ID}'
+            - name: tenant_id
+              value: '{$AZURE.TENANT.ID}'
+          tags:
+            - tag: component
+              value: raw
+        - uuid: 3342ca9e10c048f797d8a06ada1e2628
+          name: 'Azure Application Gateway: Collector error'
+          type: DEPENDENT
+          key: azure.appgw.error
+          delay: '0'
+          history: 7d
+          value_type: TEXT
+          trends: '0'
+          description: 'Error text from the collector. Empty = fine.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.error'
+              error_handler: CUSTOM_VALUE
+              error_handler_params: ''
+          master_item:
+            key: azure.appgw.data.get
+          tags:
+            - tag: component
+              value: raw
+          triggers:
+            - uuid: 23f19c6deab546b49ed2db1bee630d0d
+              expression: 'length(last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.error))>0'
+              name: 'Azure Application Gateway: Collector reported an error'
+              opdata: '{ITEM.LASTVALUE1}'
+              priority: AVERAGE
+              description: 'The collector could not read the gateway, so every other trigger of this template is blind. Read the item value.'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 514df1e6635549259e7d7e3ac37d19b6
+          name: 'Azure Application Gateway: Operational state'
+          type: DEPENDENT
+          key: azure.appgw.operational
+          delay: '0'
+          history: 7d
+          value_type: CHAR
+          trends: '0'
+          description: 'Running, Stopped, Starting or Stopping.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.operational'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.appgw.data.get
+          tags:
+            - tag: component
+              value: state
+          triggers:
+            - uuid: 40600ced227a413397f823c0b8ab83df
+              expression: 'last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.operational)<>"Running"'
+              name: 'Azure Application Gateway: Not running (state: {ITEM.LASTVALUE1})'
+              priority: HIGH
+              description: 'The gateway is stopped or changing state.'
+              dependencies:
+                - name: 'Azure Application Gateway: Collector reported an error'
+                  expression: 'length(last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 1cb3c4af3c354ac19970372b557254e9
+          name: 'Azure Application Gateway: Provisioning state'
+          type: DEPENDENT
+          key: azure.appgw.provisioning
+          delay: '0'
+          history: 7d
+          value_type: CHAR
+          trends: '0'
+          description: 'ARM provisioning state, normally Succeeded.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.provisioning'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.appgw.data.get
+          tags:
+            - tag: component
+              value: state
+          triggers:
+            - uuid: a5c81a1d8c0040aaad466e806a1522d4
+              expression: 'last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.provisioning)<>"Succeeded" and last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.provisioning)<>"Updating"'
+              name: 'Azure Application Gateway: Provisioning state is not Succeeded (state: {ITEM.LASTVALUE1})'
+              priority: WARNING
+              description: 'The last change of the gateway failed.'
+              dependencies:
+                - name: 'Azure Application Gateway: Collector reported an error'
+                  expression: 'length(last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: df0b8701871b4f6b96a479621f6c94b6
+          name: 'Azure Application Gateway: Unhealthy backend hosts'
+          type: DEPENDENT
+          key: azure.appgw.backend.unhealthy
+          delay: '0'
+          history: 7d
+          value_type: FLOAT
+          description: 'UnhealthyHostCount, newest 1-minute average. -1 = Azure returned no data point.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.unhealthy'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.appgw.data.get
+          tags:
+            - tag: component
+              value: backend
+          triggers:
+            - uuid: 926d7fc8be6e40de9a024eb09850dd58
+              expression: 'min(/Azure Application Gateway Backend Health by HTTP/azure.appgw.backend.unhealthy,{$AZURE.APPGW.BACKEND.UNHEALTHY.FOR})>{$AZURE.APPGW.BACKEND.UNHEALTHY.MAX}'
+              name: 'Azure Application Gateway: Unhealthy backend hosts detected'
+              opdata: 'Unhealthy: {ITEM.LASTVALUE1}'
+              priority: HIGH
+              description: 'One or more backend servers fail the health probe for the whole period. Check the probe path, host header, certificate and the backend NSG. The per-server detail is in the portal (Backend health) or the az command in the README.'
+              dependencies:
+                - name: 'Azure Application Gateway: Collector reported an error'
+                  expression: 'length(last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 83994b97b2294448ab83fe5936b1b211
+          name: 'Azure Application Gateway: Healthy backend hosts'
+          type: DEPENDENT
+          key: azure.appgw.backend.healthy
+          delay: '0'
+          history: 7d
+          value_type: FLOAT
+          description: 'HealthyHostCount, newest 1-minute average. -1 = Azure returned no data point.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.healthy'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.appgw.data.get
+          tags:
+            - tag: component
+              value: backend
+          triggers:
+            - uuid: fb3e3a2c194a41d6ab6aa6cfe923021a
+              expression: 'min(/Azure Application Gateway Backend Health by HTTP/azure.appgw.backend.healthy,{$AZURE.APPGW.BACKEND.UNHEALTHY.FOR})=0 and last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.backend.points)>0'
+              name: 'Azure Application Gateway: No healthy backend host'
+              priority: DISASTER
+              description: 'The gateway reports zero healthy servers: every request returns 502. If this gateway really has no backend servers configured, disable this trigger on the host.'
+              dependencies:
+                - name: 'Azure Application Gateway: Collector reported an error'
+                  expression: 'length(last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 4d1cf4df9d074f678d3fe721c93eb1f6
+          name: 'Azure Application Gateway: Backend metric data points'
+          type: DEPENDENT
+          key: azure.appgw.backend.points
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: 'Number of 1-minute points Azure returned in the last 10 minutes (both metrics). 0 = no data.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.points'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.appgw.data.get
+          tags:
+            - tag: component
+              value: backend
+          triggers:
+            - uuid: 8506adc612e14ae7a2e555cf2449324e
+              expression: 'max(/Azure Application Gateway Backend Health by HTTP/azure.appgw.backend.points,{$AZURE.APPGW.NODATA})=0'
+              name: 'Azure Application Gateway: No backend health metrics'
+              priority: WARNING
+              description: 'Azure Monitor returned no HealthyHostCount or UnhealthyHostCount data. A stopped gateway, a gateway without backends or a metrics outage all look like this, and it must not be read as "0 unhealthy".'
+              dependencies:
+                - name: 'Azure Application Gateway: Collector reported an error'
+                  expression: 'length(last(/Azure Application Gateway Backend Health by HTTP/azure.appgw.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 89fb08ade2ca44269df5eea8bc510d36
+          name: 'Azure Application Gateway: SKU'
+          type: DEPENDENT
+          key: azure.appgw.sku
+          delay: '0'
+          history: 7d
+          value_type: CHAR
+          trends: '0'
+          description: 'SKU name, for example Standard_v2 or WAF_v2.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.sku'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.appgw.data.get
+          tags:
+            - tag: component
+              value: state
+        - uuid: d4d687a6557c44958ffdfaca0bfbc9dc
+          name: 'Azure Application Gateway: Backend pools'
+          type: DEPENDENT
+          key: azure.appgw.backend.pools
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: 'Number of backend address pools.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.backend_pools'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.appgw.data.get
+          tags:
+            - tag: component
+              value: backend
+      tags:
+        - tag: class
+          value: cloud
+        - tag: target
+          value: azure
+        - tag: target
+          value: application-gateway
+      macros:
+        - macro: '{$AZURE.APP.ID}'
+          description: 'Application (client) ID of the service principal, or of a user-assigned managed identity when AUTH.MODE is msi. Set it on the HOST.'
+        - macro: '{$AZURE.AUTH.MODE}'
+          value: 'sp'
+          description: '"sp" = service principal (tenant, app id, secret). "msi" = managed identity of the Azure VM that runs the Zabbix server (tenant and secret stay empty).'
+        - macro: '{$AZURE.PASSWORD}'
+          type: SECRET_TEXT
+          description: 'Client secret of the service principal. Set it on the HOST, never on the template: a re-import with Update existing resets template-level macro values to the empty value in this file.'
+        - macro: '{$AZURE.PROXY}'
+          description: 'HTTP proxy for the Azure calls. Leave empty if not needed. Ignored for the managed identity endpoint.'
+        - macro: '{$AZURE.RESOURCE.ID}'
+          description: 'Full ARM resource ID of the monitored resource (see the template description). Set it per HOST.'
+        - macro: '{$AZURE.TENANT.ID}'
+          description: 'Entra ID tenant (directory) ID. Set it on the HOST.'
+        - macro: '{$AZURE.TIMEOUT}'
+          value: '30s'
+          description: 'Timeout of the collector script item.'
+        - macro: '{$AZURE.APPGW.BACKEND.UNHEALTHY.FOR}'
+          value: '5m'
+          description: 'How long unhealthy hosts must persist before the trigger fires.'
+        - macro: '{$AZURE.APPGW.BACKEND.UNHEALTHY.MAX}'
+          value: '0'
+          description: 'Unhealthy host count above which the trigger fires.'
+        - macro: '{$AZURE.APPGW.NODATA}'
+          value: '15m'
+          description: 'How long the metric may stay empty before the no-data trigger fires.'

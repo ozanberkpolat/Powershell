@@ -144,3 +144,20 @@ command parameters, and detection is a custom script (version at least N, servic
   success and anything else as failure, and verifies the entries are gone. Per-user classic Teams copies are reported
   by the detection script only; remove them with Microsoft's script (https://aka.ms/uninstallclassicteamsscript).
   On non-persistent AVD fix the golden image instead.
+
+## One-command inspection: Inspect-Msi.ps1
+
+`Inspect-Msi.ps1` runs the checks of the section "Inspecting an MSI and its signer" in one go, read-only, and also takes an EXE:
+
+```powershell
+.\Inspect-Msi.ps1 -Path C:\Work\app\src\app.msi -OutFile C:\Work\app\evidence\msi-info.json
+.\Inspect-Msi.ps1 -Path .\setup.exe -RequireSigned      # throws when the signature is not Valid
+```
+
+It prints the MSI properties (ProductName, ProductVersion, ProductCode, UpgradeCode, Manufacturer, ALLUSERS, ARPSYSTEMCOMPONENT, any `-Property` you name,
+or the whole table with `-AllProperties`), the package platform, SHA256, signer, thumbprint, chain and time stamper, and a `Detection` block with the values for
+the Intune detection page (MSI rule with the version check off, the matching registry rule, the install and uninstall command lines; for an EXE a file rule).
+Warnings flag an unsigned or invalid signature, an empty `ALLUSERS` (per-user install, wrong for SYSTEM), a 32-bit MSI (WOW6432Node registry view) and a missing ProductCode.
+
+Overlap with `Build-Win32Package.ps1`: that script reads the same seven MSI properties to build `install.cmd` and the detection stub while packaging. Use `Inspect-Msi.ps1`
+earlier, at research time (step 3 of the delivery standard), when you only have the vendor installer and must decide the packaging style and detection rule.

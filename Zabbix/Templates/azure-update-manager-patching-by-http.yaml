@@ -1,0 +1,1092 @@
+zabbix_export:
+  version: '6.4'
+  template_groups:
+    - uuid: 873680d7312b4393a05e9e481d1bdb9e
+      name: Templates/Azure
+  templates:
+    - uuid: 6894b7df00574782acf5f12506e0d354
+      template: 'Azure Update Manager Scheduled Patching by HTTP'
+      name: 'Azure Update Manager Scheduled Patching by HTTP'
+      description: |
+        Monitors Azure Update Manager scheduled patch runs per virtual machine.
+
+        Discovery is driven from the MAINTENANCE ASSIGNMENT inventory
+        (microsoft.maintenance/configurationassignments), not from the patch result table.
+        This is deliberate: a scheduled run that never executed produces NO result row at
+        all in Azure Resource Graph. A deallocated VM, a broken/missing patch extension,
+        patchMode not set to AutomaticByPlatform, or a schedule that was never assigned are
+        all SILENT failures. Discovering from the patch table would make those machines
+        simply disappear instead of alerting.
+
+        Machines assigned to a maintenance configuration but with no result are reported as
+        status 6 ("No result - never ran") and alert.
+
+        Requires an Entra ID service principal (or the managed identity of the Azure VM that runs
+        Zabbix, {$AZURE.AUTH.MODE}=msi) with the Reader role on the monitored scope. Set
+        {$AZURE.TENANT.ID}, {$AZURE.APP.ID} and {$AZURE.PASSWORD} on the HOST (a template re-import
+        resets template-level macro values). {$AZURE.UPD.SUBSCRIPTIONS} is optional.
+
+        Note: Azure Resource Graph retains patch installation results for approximately
+        30 days. Zabbix history is the long-term record.
+      groups:
+        - name: Templates/Azure
+      items:
+        - uuid: c1b405b5a9704444aed323d290212c66
+          name: 'Azure Update Manager: Get data'
+          type: SCRIPT
+          key: azure.upd.data.get
+          delay: 1h
+          history: '0'
+          value_type: TEXT
+          trends: '0'
+          params: |
+            // Azure Update Manager - scheduled patching collector.
+            // Zabbix embedded JS is Duktape (ES5). No let/const, no arrow functions,
+            // no Array.prototype.find. Keep it ES5.
+
+            var STATUS_MAP = {
+                'succeeded': 0,
+                'completedwithwarnings': 1,
+                'failed': 2,
+                'inprogress': 3,
+                'notstarted': 4,
+                'unknown': 5
+            };
+            // 6 = machine is assigned to a schedule but has no result row at all.
+            // 9 = Azure returned a status string we do not recognise. Deliberately NOT 0:
+            //     the Update Manager docs and the Compute REST enum disagree on the value
+            //     set, so schema drift must surface as its own alert, never as "OK".
+            var NO_RESULT = 6;
+            var UNMAPPED = 9;
+
+            function statusCode(s) {
+                var k = String(s === null || typeof s === 'undefined' ? '' : s).toLowerCase();
+                return (typeof STATUS_MAP[k] !== 'undefined') ? STATUS_MAP[k] : UNMAPPED;
+            }
+
+            function num(v) {
+                var n = Number(v);
+                return isNaN(n) ? 0 : Math.round(n);
+            }
+
+            function str(v) {
+                return (v === null || typeof v === 'undefined') ? '' : String(v);
+            }
+
+            // ---- ARG queries -------------------------------------------------------
+            // Ages are computed in KQL rather than JS on purpose: KQL tostring(datetime)
+            // emits "2026-05-04 03:55:00.0000000" (space separator), which Date.parse()
+            // does not handle in Duktape. datetime_diff() sidesteps the whole problem.
+
+            // 1. Expected-machines inventory: which VMs are bound to a maintenance schedule.
+            var Q_INVENTORY =
+                "maintenanceresources" +
+                "| where type =~ 'microsoft.maintenance/configurationassignments'" +
+                "| extend vmId = tolower(tostring(properties.resourceId))" +
+                "| where vmId has '/providers/microsoft.compute/virtualmachines/'" +
+                "| extend cfg = extract(@'/([^/]+)$', 1, tostring(properties.maintenanceConfigurationId))" +
+                "| summarize cfg = make_list(cfg) by vmId" +
+                "| extend cfg = strcat_array(cfg, ',')" +
+                "| join kind=inner (" +
+                "    resources" +
+                "    | where type =~ 'microsoft.compute/virtualmachines'" +
+                "    | project vmId = tolower(id), vm = name, rg = resourceGroup, sub = subscriptionId," +
+                "        os = tostring(properties.storageProfile.osDisk.osType)," +
+                "        patchMode = tostring(coalesce(" +
+                "            properties.osProfile.linuxConfiguration.patchSettings.patchMode," +
+                "            properties.osProfile.windowsConfiguration.patchSettings.patchMode))" +
+                "  ) on vmId" +
+                "| project vmId, vm, rg, sub, os, cfg, patchMode";
+
+            // 2. Latest patch installation result per machine.
+            var Q_RESULTS =
+                "patchinstallationresources" +
+                "| where type has 'patchinstallationresults' and type !has 'softwarepatches'" +
+                "| where id has '/providers/microsoft.compute/virtualmachines/'" +
+                "| extend vmId = tolower(extract(@'(?i)^(.*?)/patchinstallationresults/', 1, id))" +
+                "| where isnotempty(vmId)" +
+                "| extend lmt = todatetime(properties.lastModifiedDateTime)" +
+                "| summarize arg_max(lmt, *) by vmId" +
+                "| project vmId," +
+                "    status = tostring(properties.status)," +
+                "    installed = toint(properties.installedPatchCount)," +
+                "    failed = toint(properties.failedPatchCount)," +
+                "    pending = toint(properties.pendingPatchCount)," +
+                "    excluded = toint(properties.excludedPatchCount)," +
+                "    notSelected = toint(properties.notSelectedPatchCount)," +
+                "    windowExceeded = tobool(properties.maintenanceWindowExceeded)," +
+                "    rebootStatus = tostring(properties.rebootStatus)," +
+                "    startedBy = tostring(properties.startedBy)," +
+                "    runId = tostring(properties.maintenanceRunId)," +
+                "    errorDetails = tostring(properties.errorDetails)," +
+                "    ageSec = toint(datetime_diff('second', now(), lmt))," +
+                "    lastRun = format_datetime(lmt, 'yyyy-MM-dd HH:mm')";
+
+            // 3. Latest maintenance run per machine. Distinguishes "ran and failed" from
+            //    "was scheduled and skipped" (RetryLater / Cancelled / stuck Pending) --
+            //    the skipped cases never produce a patchinstallationresults row.
+            var Q_APPLY =
+                "maintenanceresources" +
+                "| where type =~ 'microsoft.maintenance/applyupdates'" +
+                "| where tostring(properties.maintenanceScope) =~ 'InGuestPatch'" +
+                "| extend vmId = tolower(coalesce(" +
+                "    tostring(properties.resourceId)," +
+                "    extract(@'(?i)^(.*?)/providers/microsoft.maintenance/applyupdates/', 1, id)))" +
+                "| where isnotempty(vmId)" +
+                "| extend lut = todatetime(coalesce(" +
+                "    properties.lastUpdateTime, properties.endDateTime, properties.startDateTime))" +
+                "| summarize arg_max(lut, *) by vmId" +
+                "| project vmId, applyStatus = tostring(properties.status)";
+
+            // 4. Permissions canary. If the SPN loses Reader, ARG returns zero rows with
+            //    HTTP 200 and no error -- indistinguishable from "nothing is scheduled"
+            //    unless we independently assert that we can see ANY VM at all.
+            //
+            //    dcount(subscriptionId) is the second half of that guard. Microsoft documents
+            //    permission-driven filtering as SILENT: "you get resource groups that you can
+            //    access, without any indication that the result might be partial." So losing
+            //    Reader on ONE subscription out of many drops those machines from monitoring
+            //    with no error and a still-healthy VM count. Tracking how many distinct
+            //    subscriptions we can see turns that into something a trigger can catch.
+            var Q_VMCOUNT =
+                "resources" +
+                "| where type =~ 'microsoft.compute/virtualmachines'" +
+                "| summarize c = count(), s = dcount(subscriptionId)";
+
+            // ---- collector ---------------------------------------------------------
+
+            var UM = {
+                p: {},
+                token: null,
+
+                setParams: function (params) {
+                    // subscriptions is deliberately NOT required. Azure Resource Graph treats
+                    // an omitted subscription list as "the whole tenant, filtered to whatever
+                    // this principal can read", which is the sane default for a fleet-wide
+                    // patch monitor -- new subscriptions are picked up automatically.
+                    // auth_mode 'msi' = managed identity of the Azure VM that runs Zabbix (IMDS); no secret needed.
+                    var need = (params && params.auth_mode === 'msi') ? [] : ['app_id', 'password', 'tenant_id'];
+                    need.forEach(function (f) {
+                        if (typeof params !== 'object' || typeof params[f] === 'undefined' || params[f] === '') {
+                            throw 'Required param is not set: ' + f + '.';
+                        }
+                    });
+                    UM.p = params;
+                },
+
+                subs: function () {
+                    var raw = UM.p.subscriptions;
+                    if (typeof raw === 'undefined' || raw === null || raw === '') { return []; }
+                    return String(raw).split(',')
+                        .map(function (s) { return s.replace(/^\s+|\s+$/g, ''); })
+                        .filter(function (s) { return s !== ''; });
+                },
+
+                login: function () {
+                    if (UM.p.auth_mode === 'msi') {
+                        // IMDS is link-local: never send it through the proxy.
+                        var m = new HttpRequest();
+                        m.addHeader('Metadata: true');
+                        var mr = m.get('http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=' +
+                            encodeURIComponent('https://management.azure.com/') +
+                            (UM.p.app_id ? '&client_id=' + encodeURIComponent(UM.p.app_id) : ''));
+                        if (m.getStatus() !== 200) {
+                            throw 'Managed identity token request failed with status ' + m.getStatus() + ': ' + String(mr).substring(0, 300);
+                        }
+                        try { UM.token = JSON.parse(mr).access_token; } catch (e0) { throw 'Failed to parse managed identity response.'; }
+                        if (!UM.token) { throw 'Managed identity response does not contain an access token.'; }
+                        return;
+                    }
+                    var req = new HttpRequest();
+                    if (UM.p.proxy) { req.setProxy(UM.p.proxy); }
+                    req.addHeader('Content-Type: application/x-www-form-urlencoded');
+                    var resp = req.post(
+                        'https://login.microsoftonline.com/' + encodeURIComponent(UM.p.tenant_id) + '/oauth2/token',
+                        'grant_type=client_credentials' +
+                        '&resource=' + encodeURIComponent('https://management.azure.com/') +
+                        '&client_id=' + encodeURIComponent(UM.p.app_id) +
+                        '&client_secret=' + encodeURIComponent(UM.p.password)
+                    );
+                    if (req.getStatus() !== 200) {
+                        throw 'Login failed with status ' + req.getStatus() + ': ' + String(resp).substring(0, 300);
+                    }
+                    var j;
+                    try { j = JSON.parse(resp); }
+                    catch (e) { throw 'Failed to parse login response.'; }
+                    if (!j.hasOwnProperty('access_token')) {
+                        throw 'Authentication response does not contain an access token.';
+                    }
+                    UM.token = j.access_token;
+                },
+
+                arg: function (query, label) {
+                    var rows = [], skip = null, page = 0;
+                    do {
+                        var req = new HttpRequest();
+                        if (UM.p.proxy) { req.setProxy(UM.p.proxy); }
+                        req.addHeader('Content-Type: application/json');
+                        req.addHeader('Authorization: Bearer ' + UM.token);
+
+                        var opts = { resultFormat: 'objectArray', '$top': 1000 };
+                        if (skip) { opts['$skipToken'] = skip; }
+
+                        // allowPartialScopes is left at its default of false on purpose. If the
+                        // tenant ever grows past what ARG will process in one query, we want a
+                        // hard error, not a quietly truncated fleet.
+                        var payload = { query: query, options: opts };
+                        var subs = UM.subs();
+                        if (subs.length > 0) { payload.subscriptions = subs; }
+
+                        var resp = req.post(
+                            'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2024-04-01',
+                            JSON.stringify(payload)
+                        );
+
+                        if (req.getStatus() !== 200) {
+                            throw 'ARG query [' + label + '] failed with status ' + req.getStatus() +
+                                ': ' + String(resp).substring(0, 300);
+                        }
+
+                        var j;
+                        try { j = JSON.parse(resp); }
+                        catch (e) { throw 'Failed to parse ARG response for [' + label + '].'; }
+
+                        var data = j.data || [];
+                        for (var i = 0; i < data.length; i++) { rows.push(data[i]); }
+
+                        skip = j['$skipToken'] || null;
+                        page++;
+                    } while (skip && page < 10);
+
+                    return rows;
+                }
+            };
+
+            function indexBy(rows, field) {
+                var map = {};
+                for (var i = 0; i < rows.length; i++) {
+                    map[String(rows[i][field]).toLowerCase()] = rows[i];
+                }
+                return map;
+            }
+
+            // Always RETURN a payload, never throw out of the item. A failed login must not
+            // look identical to "zero machines are scheduled" -- that is the exact failure
+            // mode this template exists to catch.
+            try {
+                UM.setParams(JSON.parse(value));
+                UM.login();
+
+                var inv = UM.arg(Q_INVENTORY, 'inventory');
+                var res = UM.arg(Q_RESULTS, 'results');
+                var apl = UM.arg(Q_APPLY, 'applyupdates');
+                var cnt = UM.arg(Q_VMCOUNT, 'vmcount');
+
+                var resMap = indexBy(res, 'vmId');
+                var aplMap = indexBy(apl, 'vmId');
+
+                var machines = [], withResults = 0;
+
+                for (var i = 0; i < inv.length; i++) {
+                    var m = inv[i];
+                    var id = String(m.vmId).toLowerCase();
+                    var r = resMap[id];
+                    var a = aplMap[id];
+                    if (r) { withResults++; }
+
+                    machines.push({
+                        vm: str(m.vm),
+                        rg: str(m.rg),
+                        sub: str(m.sub),
+                        os: str(m.os) || 'Unknown',
+                        cfg: str(m.cfg),
+                        patchMode: str(m.patchMode) || 'Unknown',
+                        status: r ? statusCode(r.status) : NO_RESULT,
+                        statusText: r ? str(r.status) : 'NoResult',
+                        installed: r ? num(r.installed) : 0,
+                        failed: r ? num(r.failed) : 0,
+                        pending: r ? num(r.pending) : 0,
+                        excluded: r ? num(r.excluded) : 0,
+                        notSelected: r ? num(r.notSelected) : 0,
+                        windowExceeded: (r && r.windowExceeded === true) ? 1 : 0,
+                        rebootStatus: r ? str(r.rebootStatus) : '',
+                        ageSec: r ? num(r.ageSec) : -1,
+                        lastRun: r ? str(r.lastRun) : 'never',
+                        startedBy: r ? str(r.startedBy) : '',
+                        runId: r ? str(r.runId) : '',
+                        error: r ? str(r.errorDetails) : '',
+                        applyStatus: a ? str(a.applyStatus) : ''
+                    });
+                }
+
+                return JSON.stringify({
+                    ts: Math.floor(Date.now() / 1000),
+                    machines: machines,
+                    counts: {
+                        assigned: machines.length,
+                        withResults: withResults,
+                        vmsVisible: (cnt.length > 0) ? num(cnt[0].c) : 0,
+                        subsVisible: (cnt.length > 0) ? num(cnt[0].s) : 0
+                    },
+                    err: ''
+                });
+            }
+            catch (error) {
+                error = String(error);
+                error += (error.charAt(error.length - 1) === '.') ? '' : '.';
+                Zabbix.log(3, '[ AzureUpdateManager ] ERROR: ' + error);
+                // vmsVisible is -1, NOT 0, on the failure path. 0 means "we successfully
+                // asked Azure and it returned no virtual machines" -- a genuine permissions
+                // problem. -1 means "we never got far enough to ask". Collapsing the two
+                // makes a bad client secret masquerade as a revoked role assignment.
+                return JSON.stringify({
+                    ts: Math.floor(Date.now() / 1000),
+                    machines: [],
+                    counts: { assigned: -1, withResults: -1, vmsVisible: -1, subsVisible: -1 },
+                    err: error
+                });
+            }
+          description: 'Queries Azure Resource Graph for maintenance assignments, patch installation results and maintenance runs. Result is a single JSON document consumed by dependent items and the discovery rule.'
+          timeout: '{$AZURE.UPD.TIMEOUT}'
+          parameters:
+            - name: app_id
+              value: '{$AZURE.APP.ID}'
+            - name: auth_mode
+              value: '{$AZURE.AUTH.MODE}'
+            - name: password
+              value: '{$AZURE.PASSWORD}'
+            - name: proxy
+              value: '{$AZURE.UPD.PROXY}'
+            - name: subscriptions
+              value: '{$AZURE.UPD.SUBSCRIPTIONS}'
+            - name: tenant_id
+              value: '{$AZURE.TENANT.ID}'
+          tags:
+            - tag: component
+              value: raw
+        - uuid: c72066043bb74d4e91935e1032945cf4
+          name: 'Azure Update Manager: Collector error'
+          type: DEPENDENT
+          key: azure.upd.collector.err
+          delay: '0'
+          history: 30d
+          value_type: TEXT
+          trends: '0'
+          description: 'Error text produced by the collector script. Empty when collection succeeded.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.err
+              error_handler: CUSTOM_VALUE
+              error_handler_params: 'collector returned no parseable payload'
+          master_item:
+            key: azure.upd.data.get
+          tags:
+            - tag: component
+              value: collector
+        - uuid: f999a5571a8341a5be0ec7652e5d50ef
+          name: 'Azure Update Manager: Machines assigned to a schedule'
+          type: DEPENDENT
+          key: azure.upd.count.assigned
+          delay: '0'
+          history: 90d
+          value_type: FLOAT
+          trends: 365d
+          description: 'Number of virtual machines bound to at least one maintenance configuration.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.assigned
+              error_handler: CUSTOM_VALUE
+              error_handler_params: '-1'
+          master_item:
+            key: azure.upd.data.get
+          tags:
+            - tag: component
+              value: collector
+        - uuid: 0f579e3176a0405daf11bca90506f98a
+          name: 'Azure Update Manager: Machines with a patch result'
+          type: DEPENDENT
+          key: azure.upd.count.withresults
+          delay: '0'
+          history: 90d
+          value_type: FLOAT
+          trends: 365d
+          description: 'Of the assigned machines, how many have produced a patch installation result within the Azure Resource Graph retention window.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.withResults
+              error_handler: CUSTOM_VALUE
+              error_handler_params: '-1'
+          master_item:
+            key: azure.upd.data.get
+          tags:
+            - tag: component
+              value: collector
+        - uuid: 9a60a2f11d714588b6d83a7a02d9c8d0
+          name: 'Azure Update Manager: Virtual machines visible to the service principal'
+          type: DEPENDENT
+          key: azure.upd.count.vmsvisible
+          delay: '0'
+          history: 90d
+          value_type: FLOAT
+          trends: 365d
+          description: |
+            Permissions canary. Azure Resource Graph returns an empty result set with HTTP 200
+            when the service principal has lost read access -- there is no error to detect.
+            Without this item, a revoked Reader role is indistinguishable from "no machines are
+            scheduled for patching", and every per-machine alert would silently disappear.
+
+            Values: 0 means Azure was queried successfully and returned no virtual machines
+            (a real permissions problem). -1 means the collector failed before it could ask --
+            check the "Collector error" item instead.
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.vmsVisible
+              error_handler: CUSTOM_VALUE
+              error_handler_params: '-1'
+          master_item:
+            key: azure.upd.data.get
+          tags:
+            - tag: component
+              value: collector
+        - uuid: f808ec89d32248a891beeed0c315c30a
+          name: 'Azure Update Manager: Subscriptions visible to the service principal'
+          type: DEPENDENT
+          key: azure.upd.count.subs
+          delay: '0'
+          history: 90d
+          value_type: FLOAT
+          trends: 365d
+          description: |
+            Number of distinct subscriptions in which the service principal can see virtual
+            machines.
+
+            This is the completeness guard for tenant-wide scoping. Microsoft documents
+            permission-driven filtering as silent: "you get resource groups that you can
+            access, without any indication that the result might be partial." Losing a role
+            assignment on one subscription therefore removes its machines from monitoring
+            with no error at all, while the total VM count still looks healthy. A drop in
+            this number is the only available signal.
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.subsVisible
+              error_handler: CUSTOM_VALUE
+              error_handler_params: '-1'
+          master_item:
+            key: azure.upd.data.get
+          tags:
+            - tag: component
+              value: collector
+      discovery_rules:
+        - uuid: d3a76012c29c4857a2f1af6c561d5e84
+          name: 'Azure Update Manager: Machine discovery'
+          type: DEPENDENT
+          key: azure.upd.machines.discovery
+          delay: '0'
+          lifetime: 14d
+          description: |
+            Discovers virtual machines that are assigned to an Azure Update Manager maintenance
+            configuration. Machines are discovered from the ASSIGNMENT inventory rather than
+            from the patch result table, so that a machine which has never successfully run a
+            scheduled patch job is still discovered and still alerts.
+          item_prototypes:
+            - uuid: 1a58b261522a4eecb824d3ce165c163b
+              name: '{#VMNAME}: Patch run status'
+              type: DEPENDENT
+              key: 'azure.upd.status[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 90d
+              trends: 365d
+              valuemap:
+                name: 'Azure patch run status'
+              description: 'Status of the most recent patch installation run reported by Azure Update Manager.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].status.first()'
+                  error_handler: DISCARD_VALUE
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchstatus
+                - tag: vm
+                  value: '{#VMNAME}'
+                - tag: subscription
+                  value: '{#SUBID}'
+            - uuid: 268ad975bc62482b8b78f80d4bf04888
+              name: '{#VMNAME}: Patches installed by last run'
+              type: DEPENDENT
+              key: 'azure.upd.installed[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 90d
+              trends: 365d
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].installed.first()'
+                  error_handler: DISCARD_VALUE
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchcount
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 48f645ee22ec4d2780b27f398a8d3dd4
+              name: '{#VMNAME}: Patches failed in last run'
+              type: DEPENDENT
+              key: 'azure.upd.failed[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 90d
+              trends: 365d
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].failed.first()'
+                  error_handler: DISCARD_VALUE
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchcount
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 4a7269de18a0404f9c0357572c8a6ace
+              name: '{#VMNAME}: Patches still pending'
+              type: DEPENDENT
+              key: 'azure.upd.pending[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 90d
+              trends: 365d
+              description: 'Updates that were selected for installation but had not been installed when the run ended.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].pending.first()'
+                  error_handler: DISCARD_VALUE
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchcount
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 08af7a1f184a40958c11237e9c56a840
+              name: '{#VMNAME}: Patches excluded by configuration'
+              type: DEPENDENT
+              key: 'azure.upd.excluded[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 90d
+              trends: 365d
+              description: 'Updates deliberately excluded, e.g. via packageNameMasksToExclude. A non-zero value here is expected on machines with held kernel packages.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].excluded.first()'
+                  error_handler: DISCARD_VALUE
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchcount
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 7b3e8f20e33d4bf595c5ad15239ee52e
+              name: '{#VMNAME}: Time since last patch run'
+              type: DEPENDENT
+              key: 'azure.upd.age[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 90d
+              value_type: FLOAT
+              trends: 365d
+              units: s
+              description: 'Seconds since the last patch installation result was last modified. -1 means no result exists at all.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].ageSec.first()'
+                  error_handler: DISCARD_VALUE
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchstatus
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: f3e50d53ee6e4c26aaaf30198f8836e0
+              name: '{#VMNAME}: Maintenance window exceeded'
+              type: DEPENDENT
+              key: 'azure.upd.windowexceeded[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 90d
+              trends: 365d
+              valuemap:
+                name: 'Yes/No'
+              description: 'Azure reserves 10 minutes of the maintenance window for reboot. A run can legitimately exceed the window and still report Succeeded, leaving patches pending. That is a window-sizing problem, not a patch failure.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].windowExceeded.first()'
+                  error_handler: DISCARD_VALUE
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchstatus
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 97e059f9e2364ba7b938eda608899184
+              name: '{#VMNAME}: Last patch run error'
+              type: DEPENDENT
+              key: 'azure.upd.error[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 30d
+              value_type: TEXT
+              trends: '0'
+              description: 'First error messages reported by the patch extension. This is the field that would have shown the apt exit code 100 / held-package abort.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].error.first()'
+                  error_handler: DISCARD_VALUE
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchstatus
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: b60cceb20bc741dc920f48a7fe571005
+              name: '{#VMNAME}: Last patch run timestamp'
+              type: DEPENDENT
+              key: 'azure.upd.lastrun[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 30d
+              value_type: CHAR
+              trends: '0'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].lastRun.first()'
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchstatus
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 2a85637d70f34c6fbe6b971f673b270c
+              name: '{#VMNAME}: Patch run triggered by'
+              type: DEPENDENT
+              key: 'azure.upd.startedby[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 30d
+              value_type: CHAR
+              trends: '0'
+              description: |
+                Identifies whether a user or an Azure service triggered the run. The value set is
+                NOT documented by Microsoft -- "Platform" and "User" are observed values, not a
+                contract. This item exists so the values can be confirmed against the tenant
+                before anything is built on top of them.
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].startedBy.first()'
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: patchstatus
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 2a597159fff7422ea1fc45f1dce679d6
+              name: '{#VMNAME}: Maintenance run status'
+              type: DEPENDENT
+              key: 'azure.upd.applystatus[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 30d
+              value_type: CHAR
+              trends: '0'
+              description: 'Status of the maintenance run itself (Pending, InProgress, Completed, RetryNow, RetryLater, NoUpdatesPending, Cancel, Cancelled). RetryLater or Cancelled here with no patch result is the signature of a run that was scheduled but never executed.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].applyStatus.first()'
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: maintenance
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 92a4ea7b8c5045789a7bf9372206f424
+              name: '{#VMNAME}: Patch orchestration mode'
+              type: DEPENDENT
+              key: 'azure.upd.patchmode[{#RG},{#VMNAME}]'
+              delay: '0'
+              history: 30d
+              value_type: CHAR
+              trends: '0'
+              description: 'Customer Managed Schedules require AutomaticByPlatform. Any other value means the schedule will never bind, and the machine will silently never patch.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.machines[?(@.rg==''{#RG}'' && @.vm==''{#VMNAME}'')].patchMode.first()'
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: azure.upd.data.get
+              tags:
+                - tag: component
+                  value: maintenance
+                - tag: vm
+                  value: '{#VMNAME}'
+          trigger_prototypes:
+            - uuid: 5564812ea18b4210a908fed9ca76480b
+              expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.status[{#RG},{#VMNAME}])=2'
+              name: '{#VMNAME}: Scheduled patch run FAILED'
+              event_name: '{#VMNAME}: Scheduled patch run failed ({#MAINTCFG})'
+              opdata: 'installed={?last(//azure.upd.installed[{#RG},{#VMNAME}])}'
+              priority: HIGH
+              description: |
+                Azure Update Manager reports the last patch installation run on this machine as
+                Failed. Check the "Last patch run error" item first.
+
+                A recurring cause on Linux is apt refusing the whole batch (exit code 100) when
+                a package is held -- for example linux-azure* held for ASR Mobility Service
+                compatibility. Azure calls apt without --allow-change-held-packages, so a single
+                held package aborts the entire transaction and NOTHING is installed. The fix is
+                packageNameMasksToExclude on the maintenance configuration, excluding the held
+                packages by name. Excluding by classification does not work, because kernel
+                updates are themselves classified as Security.
+              dependencies:
+                - name: 'Azure Update Manager: Collector is not returning data'
+                  expression: 'nodata(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.data.get,{$AZURE.UPD.NODATA})=1'
+                - name: 'Azure Update Manager: Service principal cannot see any virtual machine'
+                  expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.vmsvisible)=0'
+              tags:
+                - tag: scope
+                  value: availability
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: dc694b4457e5444b8e64ba300424e08c
+              expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.installed[{#RG},{#VMNAME}])=0 and last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.pending[{#RG},{#VMNAME}])>{$AZURE.UPD.PENDING.WARN} and (last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.status[{#RG},{#VMNAME}])=0 or last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.status[{#RG},{#VMNAME}])=1)'
+              name: '{#VMNAME}: Patch run reported success but installed nothing'
+              event_name: '{#VMNAME}: Patch run installed 0 updates with pending updates outstanding'
+              opdata: 'installed={ITEM.LASTVALUE1}, pending={ITEM.LASTVALUE2}'
+              priority: HIGH
+              description: |
+                The run did not report a failure, yet it installed zero updates while updates
+                were still pending. This is the silent-failure signature: the portal shows the
+                schedule as configured and the run as completed, while the machine accumulates
+                security updates indefinitely.
+
+                This is the condition that went unnoticed for months on the Zabbix VM itself.
+                Do not suppress it without establishing why the count is zero.
+              dependencies:
+                - name: 'Azure Update Manager: Collector is not returning data'
+                  expression: 'nodata(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.data.get,{$AZURE.UPD.NODATA})=1'
+                - name: 'Azure Update Manager: Service principal cannot see any virtual machine'
+                  expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.vmsvisible)=0'
+              tags:
+                - tag: scope
+                  value: availability
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: e148d2b56916416fb408e07e4f829401
+              expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.status[{#RG},{#VMNAME}])=6'
+              name: '{#VMNAME}: Assigned to a patch schedule but has never run'
+              event_name: '{#VMNAME}: No patch installation result exists ({#MAINTCFG})'
+              opdata: 'orchestration mode: {?last(//azure.upd.patchmode[{#RG},{#VMNAME}])}'
+              priority: AVERAGE
+              description: |
+                This machine is bound to a maintenance configuration, but Azure Resource Graph
+                holds no patch installation result for it at all.
+
+                A scheduled run that never executed produces no record. Common causes:
+                  - the VM was deallocated at schedule time (it must be powered on at least
+                    15 minutes before the window)
+                  - the patch extension is missing or stuck in a non-Succeeded state
+                  - patch orchestration is not set to AutomaticByPlatform, so the schedule
+                    never binds (check the "Patch orchestration mode" item)
+                  - the machine has genuinely never reached its first window yet
+
+                Also check the "Maintenance run status" item: RetryLater or Cancelled there
+                confirms the run was attempted and abandoned rather than never scheduled.
+              dependencies:
+                - name: 'Azure Update Manager: Collector is not returning data'
+                  expression: 'nodata(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.data.get,{$AZURE.UPD.NODATA})=1'
+                - name: 'Azure Update Manager: Service principal cannot see any virtual machine'
+                  expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.vmsvisible)=0'
+              tags:
+                - tag: scope
+                  value: availability
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: eaf6852465054fcf9ec57538463b4f72
+              expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.age[{#RG},{#VMNAME}])>{$AZURE.UPD.MAXAGE} and last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.status[{#RG},{#VMNAME}])<>6'
+              name: '{#VMNAME}: No patch run within the expected cadence'
+              event_name: '{#VMNAME}: Last patch run older than {$AZURE.UPD.MAXAGE}'
+              opdata: 'last run: {ITEM.LASTVALUE1} ago'
+              priority: AVERAGE
+              description: |
+                The machine has patched before, but not recently enough. Default threshold is
+                40 days, sized for a monthly schedule plus slack. Adjust {$AZURE.UPD.MAXAGE}
+                to match the actual maintenance configuration cadence.
+
+                Note that Azure Resource Graph only retains installation results for about
+                30 days, so a very stale machine may lose its result row entirely and move to
+                the "never run" trigger instead.
+              dependencies:
+                - name: 'Azure Update Manager: Collector is not returning data'
+                  expression: 'nodata(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.data.get,{$AZURE.UPD.NODATA})=1'
+                - name: 'Azure Update Manager: Service principal cannot see any virtual machine'
+                  expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.vmsvisible)=0'
+              tags:
+                - tag: scope
+                  value: availability
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 6d87e0e9a9ab4afabbb6d0c3af6f26a9
+              expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.status[{#RG},{#VMNAME}])=1'
+              name: '{#VMNAME}: Patch run completed with warnings'
+              opdata: 'failed={?last(//azure.upd.failed[{#RG},{#VMNAME}])}'
+              priority: WARNING
+              description: 'Some individual updates did not install cleanly. Check the failed count and the error item.'
+              dependencies:
+                - name: 'Azure Update Manager: Collector is not returning data'
+                  expression: 'nodata(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.data.get,{$AZURE.UPD.NODATA})=1'
+                - name: 'Azure Update Manager: Service principal cannot see any virtual machine'
+                  expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.vmsvisible)=0'
+              tags:
+                - tag: scope
+                  value: availability
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: 923cb2bddd2d4c2e9b9478fabe5728ce
+              expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.windowexceeded[{#RG},{#VMNAME}])=1 and last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.pending[{#RG},{#VMNAME}])>0'
+              name: '{#VMNAME}: Maintenance window too short, updates left pending'
+              opdata: 'pending={ITEM.LASTVALUE2}'
+              priority: WARNING
+              description: |
+                The run ran out of maintenance window with updates still pending. This is a
+                window-sizing problem rather than a patch failure. Microsoft recommends at
+                least 25 minutes for normal updates and 30 minutes when service packs are in
+                scope, and reserves the final 10 minutes of any window for reboot.
+              dependencies:
+                - name: 'Azure Update Manager: Collector is not returning data'
+                  expression: 'nodata(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.data.get,{$AZURE.UPD.NODATA})=1'
+                - name: 'Azure Update Manager: Service principal cannot see any virtual machine'
+                  expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.vmsvisible)=0'
+              tags:
+                - tag: scope
+                  value: performance
+                - tag: vm
+                  value: '{#VMNAME}'
+            - uuid: edff705f3a16473f85a32b74d5649443
+              expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.status[{#RG},{#VMNAME}])=9'
+              name: '{#VMNAME}: Unrecognised patch run status returned by Azure'
+              priority: INFO
+              description: |
+                Azure returned a status string this template does not map. Schema drift guard:
+                the Update Manager documentation and the Compute REST enum already disagree on
+                the value set, so an unknown value is mapped to 9 rather than silently treated
+                as success. Inspect the raw collector output and extend STATUS_MAP.
+              dependencies:
+                - name: 'Azure Update Manager: Collector is not returning data'
+                  expression: 'nodata(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.data.get,{$AZURE.UPD.NODATA})=1'
+              tags:
+                - tag: scope
+                  value: notice
+                - tag: vm
+                  value: '{#VMNAME}'
+          master_item:
+            key: azure.upd.data.get
+          lld_macro_paths:
+            - lld_macro: '{#MAINTCFG}'
+              path: $.cfg
+            - lld_macro: '{#OSTYPE}'
+              path: $.os
+            - lld_macro: '{#RG}'
+              path: $.rg
+            - lld_macro: '{#SUBID}'
+              path: $.sub
+            - lld_macro: '{#VMNAME}'
+              path: $.vm
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.machines
+              error_handler: CUSTOM_VALUE
+              error_handler_params: '[]'
+          filter:
+            evaltype: AND
+            conditions:
+              - macro: '{#OSTYPE}'
+                value: '{$AZURE.UPD.LLD.OSTYPE.MATCHES}'
+                formulaid: A
+              - macro: '{#VMNAME}'
+                value: '{$AZURE.UPD.LLD.VMNAME.MATCHES}'
+                formulaid: B
+              - macro: '{#VMNAME}'
+                value: '{$AZURE.UPD.LLD.VMNAME.NOT_MATCHES}'
+                operator: NOT_MATCHES_REGEX
+                formulaid: C
+      tags:
+        - tag: class
+          value: cloud
+        - tag: target
+          value: azure
+        - tag: subclass
+          value: patching
+      macros:
+        - macro: '{$AZURE.APP.ID}'
+          description: 'Application (client) ID of the Entra ID service principal.'
+        - macro: '{$AZURE.AUTH.MODE}'
+          value: sp
+          description: '"sp" = service principal (tenant, app id, secret). "msi" = managed identity of the Azure VM running the Zabbix server (leave tenant and secret empty; app id only for a user-assigned identity).'
+        - macro: '{$AZURE.PASSWORD}'
+          type: SECRET_TEXT
+          description: 'Client secret of the Entra ID service principal. Set it on the HOST, never here: a re-import with Update existing resets template macro values.'
+        - macro: '{$AZURE.TENANT.ID}'
+          description: 'Entra ID tenant (directory) ID.'
+        - macro: '{$AZURE.UPD.LLD.OSTYPE.MATCHES}'
+          value: '.*'
+          description: 'Discover only machines whose OS type matches this regular expression, e.g. Linux.'
+        - macro: '{$AZURE.UPD.LLD.VMNAME.MATCHES}'
+          value: '.*'
+          description: 'Discover only machines whose name matches this regular expression.'
+        - macro: '{$AZURE.UPD.LLD.VMNAME.NOT_MATCHES}'
+          value: CHANGE_IF_NEEDED
+          description: 'Do not discover machines whose name matches this regular expression.'
+        - macro: '{$AZURE.UPD.MAXAGE}'
+          value: 40d
+          description: 'Alert if the last patch run is older than this. Default sized for a monthly schedule plus slack.'
+        - macro: '{$AZURE.UPD.NODATA}'
+          value: 3h
+          description: 'Alert if the collector has produced no data for this long. Should be at least twice the item interval.'
+        - macro: '{$AZURE.UPD.PENDING.WARN}'
+          value: '1'
+          description: 'Minimum pending patch count that makes a zero-install run suspicious.'
+        - macro: '{$AZURE.UPD.PROXY}'
+          description: 'HTTP proxy for the Azure API calls. Leave empty if not required. Note that if the Zabbix host also uses IMDS, 169.254.169.254 must bypass the proxy.'
+        - macro: '{$AZURE.UPD.SUBSCRIPTIONS}'
+          description: 'OPTIONAL. Leave EMPTY to query the whole tenant - Azure Resource Graph then returns every subscription the service principal can read, and new subscriptions are picked up automatically. Set a comma-separated list of subscription IDs only to deliberately narrow the scope.'
+        - macro: '{$AZURE.UPD.TIMEOUT}'
+          value: 60s
+          description: 'Timeout of the collector script item.'
+      valuemaps:
+        - uuid: d9d9364a0b714cd99217771cb7798b0a
+          name: 'Azure patch run status'
+          mappings:
+            - value: '0'
+              newvalue: Succeeded
+            - value: '1'
+              newvalue: 'Completed with warnings'
+            - value: '2'
+              newvalue: Failed
+            - value: '3'
+              newvalue: 'In progress'
+            - value: '4'
+              newvalue: 'Not started'
+            - value: '5'
+              newvalue: Unknown
+            - value: '6'
+              newvalue: 'No result - never ran'
+            - value: '9'
+              newvalue: 'Unmapped status'
+        - uuid: afd9b25eaaa34c14bcf5e6dcdb2f37fb
+          name: 'Yes/No'
+          mappings:
+            - value: '0'
+              newvalue: 'No'
+            - value: '1'
+              newvalue: 'Yes'
+  triggers:
+    - uuid: 0e18b508f92748b3bb033f500c95d950
+      expression: 'nodata(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.data.get,{$AZURE.UPD.NODATA})=1'
+      name: 'Azure Update Manager: Collector is not returning data'
+      priority: AVERAGE
+      description: |
+        The collector script item has produced no value. Every per-machine trigger depends on
+        this one, so a dead collector suppresses the fan-out rather than producing hundreds of
+        misleading recoveries.
+      tags:
+        - tag: scope
+          value: availability
+    - uuid: 14ab94ba0d7b4ce6a1ee1b04d7e7d5b1
+      expression: 'length(last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.collector.err))>0'
+      name: 'Azure Update Manager: Collector reported an error'
+      opdata: '{ITEM.LASTVALUE1}'
+      priority: AVERAGE
+      description: 'The collector returned a payload but could not complete. Typical causes are an expired client secret, a revoked service principal, or Azure Resource Graph throttling.'
+      tags:
+        - tag: scope
+          value: availability
+    - uuid: d618bf371dba4f4ca720a14bd6ee5be2
+      expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.subs)>=0 and last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.subs)<max(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.subs,7d)'
+      name: 'Azure Update Manager: Fewer subscriptions visible than in the last 7 days'
+      event_name: 'Azure Update Manager: Subscription visibility dropped to {ITEM.LASTVALUE1}'
+      opdata: 'now={ITEM.LASTVALUE1}, 7d peak={ITEM.LASTVALUE2}'
+      priority: AVERAGE
+      description: |
+        The service principal can see virtual machines in fewer subscriptions than it could
+        at some point in the last 7 days.
+
+        This matters because Azure Resource Graph filters results to what the caller can read
+        and gives NO indication that the result is partial. If a Reader assignment is removed
+        from one subscription, every machine in it silently leaves monitoring: no error, no
+        empty result, and the overall VM count may barely move. The "cannot see any virtual
+        machine" trigger only catches total loss of access -- this one catches partial loss.
+
+        Self-calibrating: no threshold to configure, and it stays in problem state for as
+        long as visibility is degraded rather than flapping on a single change.
+
+        If the drop is legitimate (a subscription was decommissioned), close the problem and
+        it will re-baseline within 7 days.
+      dependencies:
+        - name: 'Azure Update Manager: Collector reported an error'
+          expression: 'length(last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.collector.err))>0'
+      tags:
+        - tag: scope
+          value: availability
+    - uuid: 3ea56e3068ff4e3da5ce7d5e9a1c0e8b
+      expression: 'last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.count.vmsvisible)=0'
+      name: 'Azure Update Manager: Service principal cannot see any virtual machine'
+      priority: AVERAGE
+      description: |
+        Azure Resource Graph was queried successfully and returned zero virtual machines.
+        Because ARG answers with HTTP 200 and an empty result set when read access has been
+        removed, a revoked Reader role is otherwise indistinguishable from "nothing is
+        configured for patching" -- and every per-machine alert would silently vanish.
+        Verify the role assignment on the subscription before assuming the estate is
+        genuinely empty.
+
+        This trigger fires only on 0, not on -1. A -1 means the collector failed before it
+        could query Azure (unset macro, bad client secret, throttling) -- that is reported by
+        "Collector reported an error", which this trigger depends on.
+      dependencies:
+        - name: 'Azure Update Manager: Collector reported an error'
+          expression: 'length(last(/Azure Update Manager Scheduled Patching by HTTP/azure.upd.collector.err))>0'
+      tags:
+        - tag: scope
+          value: availability
