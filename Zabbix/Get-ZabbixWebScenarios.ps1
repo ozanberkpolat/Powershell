@@ -62,7 +62,7 @@ foreach ($it in $raw) {
 if ($unparsed.Count) { Write-Warning "$($unparsed.Count) web.test item(s) not parsed (other metric or unusual key), for example: $($unparsed[0])" }
 if ($rows.Count -eq 0) { throw "No web scenario items found on any host in '$($GroupName -join ', ')'. Check the group and that the scenarios sit on hosts inside it." }
 
-$sites = $rows | Group-Object HostId, Scenario
+$sites = @($rows | Group-Object HostId, Scenario)   # @(): one group would otherwise report its item count as .Count
 Write-Host "$($sites.Count) scenario(s):"
 foreach ($s in ($sites | Sort-Object Name)) { Write-Host ('    {0} - {1}  ({2} items)' -f $s.Group[0].Host, $s.Group[0].Scenario, $s.Count) }
 if ($OutFile) { $rows | Export-Csv $OutFile -NoTypeInformation -Encoding UTF8; Write-Host "Wrote $OutFile" }

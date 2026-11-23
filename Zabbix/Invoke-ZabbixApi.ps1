@@ -25,6 +25,9 @@
       * Results are returned with a leading comma so a one-row result stays an array. Without it PowerShell unrolls
         the single object and `.Count` reads the property count instead of the row count.
       * `host.get` etc. return numbers as strings; compare as strings or cast.
+      * Because of that leading comma, ASSIGN the result (`$rows = Invoke-ZabbixApi ...`) or wrap the call in its own
+        parentheses (`@((Invoke-ZabbixApi ...))`). `@(Invoke-ZabbixApi ...)` nests the array: `.Count` is then 1 for zero
+        rows and for fifty, and piping it hands the whole row set to the next command as one object.
       * A system proxy cannot reach a private address that exists only on a VPN, and the failure looks exactly like
         "VPN down". The session therefore goes direct (process-wide DefaultWebProxy = $null) unless -UseSystemProxy.
       * A connection that dropped mid-run is reported with the method and request number, so a long collection can
@@ -90,7 +93,7 @@ function Connect-ZabbixApi {
         $line = ($line -replace '^ZABBIX_TOKEN\s*=\s*', '').Trim('"', "'")
         if ($line.Length -lt 20) { throw "Token file $TokenFile does not look like an API token (too short)." }
         $Token = ConvertTo-SecureString $line -AsPlainText -Force
-        Remove-Variable line
+        Remove-Variable line -WhatIf:$false
     }
     $rpc = $Url.TrimEnd('/')
     if ($rpc -notmatch 'api_jsonrpc\.php$') { $rpc += '/api_jsonrpc.php' }
@@ -179,8 +182,9 @@ function Save-ZabbixEvidence {
     <# .SYNOPSIS Writes an object as JSON to <Dir>\<yyyyMMdd-HHmmss>-<Name>.json and returns the path. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)]$Object, [string]$Dir = (Join-Path (Get-Location) 'evidence'))
-    New-Item -ItemType Directory -Force $Dir | Out-Null
+    # -WhatIf:$false: evidence is a local read-only record and must be written in a -WhatIf run too.
+    New-Item -ItemType Directory -Force $Dir -WhatIf:$false | Out-Null
     $path = Join-Path $Dir ('{0}-{1}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $Name)
-    $Object | ConvertTo-Json -Depth 20 | Out-File -FilePath $path -Encoding utf8
+    $Object | ConvertTo-Json -Depth 20 | Out-File -FilePath $path -Encoding utf8 -WhatIf:$false
     $path
 }

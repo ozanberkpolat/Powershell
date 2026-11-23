@@ -114,13 +114,13 @@ if ($Stage -eq 'Scenario') {
     $failItems = Invoke-ZabbixApi -Method item.get -Params @{ hostids = $hostRow.hostid; webitems = $true; search = @{ key_ = "web.test.fail[$ScenarioName]" }; output = @('itemid', 'key_', 'lastvalue') }
     if ($failItems.Count -ne 1) { throw "Expected one web.test.fail item for '$ScenarioName', found: $(($failItems | ForEach-Object { $_.key_ }) -join ', ')" }
     $item = $failItems[0]
-    $hist = @(Invoke-ZabbixApi -Method history.get -AllowEmpty -Params @{ itemids = $item.itemid; history = 3; sortfield = 'clock'; sortorder = 'DESC'; limit = 3; output = 'extend' })
+    $hist = @((Invoke-ZabbixApi -Method history.get -AllowEmpty -Params @{ itemids = $item.itemid; history = 3; sortfield = 'clock'; sortorder = 'DESC'; limit = 3; output = 'extend' }))
     $values = @($hist | ForEach-Object { $_.value })
     Write-Host "$($item.key_) last values: $($values -join ', ')"
     if ($values.Count -lt 3 -or @($values | Where-Object { $_ -ne '0' }).Count -gt 0) {
         throw 'REFUSED: the check is failing or has too little history (needs 3 stored values, all 0); the trigger would fire on create. Fix the scenario or wait for history.'
     }
-    $existing = @(Invoke-ZabbixApi -Method trigger.get -AllowEmpty -Params @{ hostids = $hostRow.hostid; filter = @{ description = $TriggerName }; output = @('triggerid') })
+    $existing = @((Invoke-ZabbixApi -Method trigger.get -AllowEmpty -Params @{ hostids = $hostRow.hostid; filter = @{ description = $TriggerName }; output = @('triggerid') }))
     if ($existing.Count -gt 0) { Write-Host '= trigger already exists'; return }
     $tags = @($Tag.Keys | ForEach-Object { @{ tag = [string]$_; value = [string]$Tag[$_] } })
     $trigger = @{

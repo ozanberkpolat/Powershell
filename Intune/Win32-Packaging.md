@@ -124,3 +124,23 @@ Uploading is a write (`DeviceManagementApps.ReadWrite.All` and an Intune role): 
    Empty means clean; an entry's 3089 event with the same ActivityID names the signer.
 5. MSI and script blocks: log `Microsoft-Windows-AppLocker/MSI and Script`, events 8028 (audit) and 8029 (enforced).
 6. Uninstall once on a test device and check that detection turns false and no files remain.
+
+## Worked example: Zabbix agent 2 with TLS PSK
+
+`Zabbix-Agent2/` applies this standard to an agent that needs a secret file: the PSK ships as `psk.key`, the install
+script locks it to SYSTEM and Administrators before the MSI starts the service, server and PSK identity are install
+command parameters, and detection is a custom script (version at least N, service, PSK settings). See `Zabbix-Agent2/README.md`.
+
+## After the update: health test and remediations
+
+- `Test-AppInstallHealth.ps1` (read-only) checks an updated app the way users break on it: file version (compared as a
+  version, not a string prefix), a second copy in the other Program Files folder, uninstall entries in both registry
+  views, the "Open with" shell verb for the machine and for every loaded user hive, and context-menu handler DLLs that
+  still exist. `-ExitCode` turns it into a pass/fail for a Remediations detection script or Run Command.
+- `Remediation/TeamsMwi-Detect.ps1` and `Remediation/TeamsMwi-Remediate.ps1` are a Remediations pair that removes the
+  classic Teams Machine-Wide Installer. Settings: run as SYSTEM, signature check off (or UTF-8 without BOM when on),
+  64-bit host may stay No (the remediation relaunches itself in 64-bit PowerShell because the Appx cmdlets fail in the
+  32-bit host). The remediation refuses unless new Teams is installed or provisioned, treats msiexec 0/3010/1605 as
+  success and anything else as failure, and verifies the entries are gone. Per-user classic Teams copies are reported
+  by the detection script only; remove them with Microsoft's script (https://aka.ms/uninstallclassicteamsscript).
+  On non-persistent AVD fix the golden image instead.

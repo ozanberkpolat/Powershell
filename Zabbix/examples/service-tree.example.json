@@ -1,0 +1,30 @@
+{
+  "services": [
+    {
+      "name": "Online Shop",
+      "description": "Contoso online shop. Report-only tree: no service actions, no SLA.",
+      "tags": { "tenant": "contoso", "bsvc-root": "shop" },
+      "children": [
+        {
+          "name": "Front end",
+          "children": [
+            { "name": "Web server availability", "problemTags": [ { "tag": "bsvc", "value": "shop-web" }, { "tag": "scope", "value": "availability" } ] },
+            { "name": "Public HTTPS check", "problemTags": [ { "tag": "bsvc", "value": "shop-public" }, { "tag": "check", "value": "public-https" } ] }
+          ]
+        },
+        {
+          "name": "Back end",
+          "children": [
+            { "name": "Application ports", "problemTags": [ { "tag": "bsvc", "value": "shop-app" }, { "tag": "check", "value": "app-port" } ] },
+            { "name": "Application Windows services", "problemTags": [ { "tag": "bsvc", "value": "shop-app" }, { "tag": "service", "operator": "contains", "value": "Contoso" } ] },
+            {
+              "name": "Database",
+              "description": "Pending: database-level monitoring is not in place yet. This node stays OK until items or triggers carrying these tags exist.",
+              "problemTags": [ { "tag": "bsvc", "value": "shop-db" }, { "tag": "scope", "value": "availability" } ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

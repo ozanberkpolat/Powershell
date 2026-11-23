@@ -1,0 +1,7 @@
+Host,Tag,Value
+SHOP-WEB01,bsvc,shop-web
+SHOP-WEB01,environment,prod
+SHOP-APP01,bsvc,shop-app
+SHOP-DB01,bsvc,shop-db
+SHOP-DB01,environment,prod
+SHOP-TEST01,environment,nonprod
