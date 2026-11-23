@@ -75,6 +75,8 @@ function Invoke-ArmRequest {
         Ceiling for one wait.
     .PARAMETER IgnoreNotFound
         Return $null on 404 instead of throwing.
+    .PARAMETER ReadOnly
+        The call is a read even though it is not a GET (for example a Resource Graph POST): run it under -WhatIf too.
     #>
     [CmdletBinding()]
     param(
@@ -84,12 +86,16 @@ function Invoke-ArmRequest {
         [int]$MaxRetries = 5,
         [int]$MinWaitSeconds = 5,
         [int]$MaxWaitSeconds = 180,
-        [switch]$IgnoreNotFound
+        [switch]$IgnoreNotFound,
+        [switch]$ReadOnly
     )
     $rel = $Path -replace '^https://management\.azure\.com', ''
     $payload = if ($null -eq $Body) { $null } elseif ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
     for ($attempt = 1; $attempt -le $MaxRetries + 1; $attempt++) {
         $p = @{ Method = $Method; Path = $rel; ErrorAction = 'Stop' }
+        # Invoke-AzRestMethod supports -WhatIf: under a script's -WhatIf it would skip reads too and return
+        # nothing, so a dry run plans from an empty list. Reads always run; writes stay gated by the caller.
+        if ($Method -eq 'GET' -or $ReadOnly) { $p.WhatIf = $false }
         if ($payload) { $p.Payload = $payload }
         $resp = Invoke-AzRestMethod @p
         $code = [int]$resp.StatusCode
@@ -171,7 +177,7 @@ function Search-Graph {
         $opts = @{ '$top' = $PageSize; resultFormat = 'objectArray' }
         if ($token) { $opts['$skipToken'] = $token }
         $body = @{ query = $Query; options = $opts } + $scope
-        $r = Invoke-ArmRequest -Method POST -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01' -Body $body
+        $r = Invoke-ArmRequest -Method POST -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01' -Body $body -ReadOnly
         foreach ($row in @($r.data)) { [void]$all.Add($row) }
         $token = $r.'$skipToken'
     } while ($token)

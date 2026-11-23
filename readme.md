@@ -134,3 +134,17 @@ Then run any script directly:
 ## Author
 
 Maintained by [ozanberkpolat](https://github.com/ozanberkpolat)
+
+### Cleanup, monitoring and M365 additions
+
+Cleanup scripts report by default and change nothing until `-Apply` is passed; every write is then also guarded by `-WhatIf` / `-Confirm`.
+
+| Path | Description |
+|------|-------------|
+| `Azure/Networking/Remove-DanglingNics.ps1` | Unattached NICs (no VM, private endpoint, private link service or hosted workload) with IPs and NSGs; `-Apply` re-checks each NIC live, backs up its JSON, then deletes |
+| `Azure/Networking/Remove-EmptyPrivateDnsZoneLinks.ps1` | Unlink SOA-only private DNS zones (which shadow public names with NXDOMAIN) from one VNet; re-checks emptiness, skips auto-registration links, polls the async deletes |
+| `Azure/Storage/Remove-WadTables.ps1` | Delete legacy WAD* diagnostic tables through the management plane; refuses while a diagnostics extension still writes to the account; logs names first |
+| `Azure/Monitoring/Set-BlobDiagnosticsPolicy.ps1` | Blob StorageRead/Write/Delete logs to Log Analytics: built-in DeployIfNotExists policy per subscription with identity roles and remediation, or direct diagnostic settings |
+| `Azure/Entra_Connect/Upgrade-StagingSwap.md` | Runbook: Entra Connect upgrade with an active/staging pair (upgrade staging, swap with one exporter at a time, upgrade the other, rollback) |
+| `M365/Repair-SPOSiteUserMismatch.ps1` | SharePoint Online site user ID mismatch: scan sites for a re-created user's old record, back up group memberships, remove and restore; Constrained Language Mode safe |
+| `M365/License_Assignments.ps1` | Extended: SKU consumption (enabled / warning / suspended / consumed), group-based licence report, users on one SKU with direct or group assignment |
