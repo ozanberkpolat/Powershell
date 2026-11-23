@@ -80,7 +80,7 @@ Additions to the lessons above; read them together.
   $msRdSpId = (Get-MgServicePrincipal -Filter "AppId eq 'a4a365df-50f1-4397-bc59-1a1564b8bb9c'").Id  # Microsoft Remote Desktop
   Get-MgServicePrincipalRemoteDesktopSecurityConfiguration -ServicePrincipalId $wclSpId   # IsRemoteDesktopProtocolEnabled : True
   ```
-  Current Microsoft Learn lists only Windows Cloud Login as required; older guidance enabled both, which is harmless. When the configuration object already exists, `New-...` fails: use `Update-MgServicePrincipalRemoteDesktopSecurityConfiguration -ServicePrincipalId $wclSpId -IsRemoteDesktopProtocolEnabled`. The portal path is Entra ID > Devices > Remote connection configuration.
+  The current AVD single sign-on article lists only Windows Cloud Login, which replaces the older Microsoft Remote Desktop app; the deployment behind these notes enabled both. The current article checks with `Get-...` first and then calls `Update-MgServicePrincipalRemoteDesktopSecurityConfiguration -ServicePrincipalId $wclSpId -IsRemoteDesktopProtocolEnabled`. The portal path is Entra ID > Devices > Remote connection configuration.
 - The consent prompt is hidden with up to 10 target device groups on Windows Cloud Login (`New-MgServicePrincipalRemoteDesktopSecurityConfigurationTargetDeviceGroup`). A dynamic device group is the usual choice; it can take up to 24 hours to fill in large tenants.
 - SSO on hybrid-joined hosts WITHOUT the Kerberos server object shows up as "the specific session doesn't exist" or as a normal password prompt (SSO silently skipped), not as a clear error.
 - Hosts in a different AD domain than the users need a two-way trust, otherwise connections fall back to older authentication.

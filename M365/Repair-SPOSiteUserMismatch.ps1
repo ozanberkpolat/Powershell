@@ -40,8 +40,9 @@
 .PARAMETER IncludePersonalSite
     Scan: also scan OneDrive sites (Get-SPOSite -IncludePersonalSite). Slow in large tenants.
 .PARAMETER GrantTemporaryAdmin
-    Scan: on a site that answers access denied, add -AdminUpn as site collection admin, scan it, and remove
-    that admin again at the end. Without it such sites are listed as ERROR for manual follow-up.
+    Scan and Repair: on a site that answers access denied, add -AdminUpn as site collection admin, do the work,
+    and remove that admin again (only where the script added it). Without it such sites are listed as ERROR
+    for manual follow-up.
 .PARAMETER AdminUpn
     The account running the script, needed with -GrantTemporaryAdmin.
 .PARAMETER OutDir
@@ -73,8 +74,12 @@
       - The Groups and IsSiteAdmin properties of Get-SPOUser are not documented: review the backup file
         before repairing.
       - Access granted through an Entra or Microsoft 365 group comes back by itself on the next visit.
+      - UNTESTED against a live tenant: the error texts matched for "access denied" and "user not found"
+        (English and German) are a best guess; an unmatched error is listed as ERROR, never as not found.
       - Constrained Language Mode blocks [pscustomobject]@{} casts ("only core types are supported in this
-        language mode"); this script avoids them.
+        language mode") and method calls on non-core types, $PSCmdlet.ShouldProcess included. This script
+        avoids both: under CLM -WhatIf still works but -Confirm does not prompt, so test with -Site first.
+        Scan and Repair were run under ConstrainedLanguage against stubbed SPO cmdlets (not a live tenant).
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
@@ -148,6 +153,8 @@ if ($Mode -eq 'Scan') {
 }
 
 # ---- Repair ----
+# Constrained Language Mode blocks method calls on non-core types, $PSCmdlet.ShouldProcess included.
+$fullLanguage = $ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage'
 if (-not (Test-Path $backupFile)) { throw "Backup file $backupFile not found. Run -Mode Scan first and review it." }
 $rows = @(Import-Csv -Path $backupFile -Delimiter ';' -Header Site, Group, IsSiteAdmin)
 if (-not $rows.Count) { throw "Backup file $backupFile is empty: nothing to repair." }
@@ -157,10 +164,27 @@ foreach ($s in $targets) {
     if (Test-OwnOneDrive $s) { Write-Warning "Own OneDrive $s skipped (use the diagnostic)."; continue }
     $mine = @($rows | Where-Object { $_.Site -eq $s })
     if (-not $mine.Count) { Write-Warning "$s is not in the backup file: skipped (nothing saved to restore)."; continue }
-    if (-not $PSCmdlet.ShouldProcess($s, "Remove old record of $UserPrincipalName and restore $($mine.Count) membership row(s)")) { continue }
+    $what = "Remove old record of $UserPrincipalName and restore $($mine.Count) membership row(s)"
+    if ($fullLanguage) { if (-not $PSCmdlet.ShouldProcess($s, $what)) { continue } }
+    elseif ($WhatIfPreference) { Write-Host "What if: $what on $s"; continue }   # CLM: $PSCmdlet methods are blocked, so no -Confirm prompt
     $log = @()
+    $granted = $false
+    if ($GrantTemporaryAdmin) {
+        # Probe: access denied means the admin is not site collection admin here; grant it for this site only.
+        try { Get-SPOUser -Site $s -LoginName $UserPrincipalName -ErrorAction Stop | Out-Null }
+        catch {
+            if ($_.Exception.Message -match 'denied|unauthori|zugriff') {
+                try { Set-SPOUser -Site $s -LoginName $AdminUpn -IsSiteCollectionAdmin $true -ErrorAction Stop | Out-Null; $granted = $true; $log += "TEMPADMIN_ADDED;$s" }
+                catch { $log += "ERROR_TEMPADMIN;$s;$($_.Exception.Message)" }
+            }
+        }
+    }
     try { Remove-SPOUser -Site $s -LoginName $UserPrincipalName -ErrorAction Stop; $log += "REMOVED;$s" }
-    catch { $log += "ERROR_REMOVE;$s;$($_.Exception.Message)"; $failed++; $log | Add-Content -Path $repairFile -Encoding UTF8 -WhatIf:$false; Write-Warning $log[-1]; continue }
+    catch {
+        $log += "ERROR_REMOVE;$s;$($_.Exception.Message)"; $failed++
+        if ($granted) { try { Set-SPOUser -Site $s -LoginName $AdminUpn -IsSiteCollectionAdmin $false -ErrorAction Stop | Out-Null; $log += "TEMPADMIN_REMOVED;$s" } catch { $log += "ERROR_TEMPADMIN_REMOVE;$s;$($_.Exception.Message)"; $failed++ } }
+        $log | Add-Content -Path $repairFile -Encoding UTF8 -WhatIf:$false; $log | ForEach-Object { Write-Warning $_ }; continue
+    }
     foreach ($r in $mine) {
         if (-not $r.Group) { continue }
         try { Add-SPOUser -Site $s -LoginName $UserPrincipalName -Group $r.Group -ErrorAction Stop | Out-Null; $log += "ADDED;$s;$($r.Group)" }
@@ -169,6 +193,10 @@ foreach ($s in $targets) {
     if ($mine[0].IsSiteAdmin -eq 'True') {
         try { Set-SPOUser -Site $s -LoginName $UserPrincipalName -IsSiteCollectionAdmin $true -ErrorAction Stop | Out-Null; $log += "SITEADMIN;$s" }
         catch { $log += "ERROR_SITEADMIN;$s;$($_.Exception.Message)"; $failed++ }
+    }
+    if ($granted) {
+        try { Set-SPOUser -Site $s -LoginName $AdminUpn -IsSiteCollectionAdmin $false -ErrorAction Stop | Out-Null; $log += "TEMPADMIN_REMOVED;$s" }
+        catch { $log += "ERROR_TEMPADMIN_REMOVE;$s;$($_.Exception.Message)"; $failed++ }
     }
     $log | Add-Content -Path $repairFile -Encoding UTF8 -WhatIf:$false
     $log | ForEach-Object { Write-Host $_ }

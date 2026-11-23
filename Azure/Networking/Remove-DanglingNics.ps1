@@ -78,7 +78,7 @@ $stamp = Get-Date -Format yyyyMMdd-HHmmss
 
 function Test-Attached($n) {
     $p = $n.properties
-    [bool]($p.virtualMachine.id -or $p.privateEndpoint.id -or $p.privateLinkService.id -or @($p.hostedWorkloads).Count)
+    [bool]($p.virtualMachine.id -or $p.privateEndpoint.id -or $p.privateLinkService.id -or @($p.hostedWorkloads | Where-Object { $_ }).Count)   # @($null).Count is 1
 }
 
 $kql = @"
@@ -87,13 +87,9 @@ resources
 | where isempty(tostring(properties.virtualMachine.id))
     and isempty(tostring(properties.privateEndpoint.id))
     and isempty(tostring(properties.privateLinkService.id))
-    and array_length(coalesce(properties.hostedWorkloads, dynamic([]))) == 0
-| extend ipc = properties.ipConfigurations
-| project id, name, resourceGroup, subscriptionId, location,
-    PrivateIPs = strcat_array(ipc[*].properties.privateIPAddress, ','),
-    Subnet = tostring(ipc[0].properties.subnet.id),
-    Nsg = tostring(properties.networkSecurityGroup.id),
-    LbPools = array_length(ipc[0].properties.loadBalancerBackendAddressPools)
+    and (isnull(properties.hostedWorkloads) or array_length(properties.hostedWorkloads) == 0)
+| project id, name, resourceGroup, subscriptionId, location, ipc = properties.ipConfigurations,
+    Nsg = tostring(properties.networkSecurityGroup.id)
 "@
 $found = @(if ($Subscription) { Search-Graph -Query $kql -Subscription $Subscription } else { Search-Graph -Query $kql })
 if ($ResourceGroup) { $found = @($found | Where-Object { $ResourceGroup -contains $_.resourceGroup }) }
@@ -112,7 +108,10 @@ if ($InputCsv) {
 $rows = foreach ($t in $targets) {
     [pscustomobject]@{
         SubscriptionId = $t.subscriptionId; ResourceGroup = $t.resourceGroup; Name = $t.name; Location = $t.location
-        PrivateIPs = $t.PrivateIPs; Subnet = ($t.Subnet -split '/')[-1]; Nsg = ($t.Nsg -split '/')[-1]; LbPools = $t.LbPools
+        PrivateIPs = (@($t.ipc | ForEach-Object { $_.properties.privateIPAddress }) -join ',')
+        Subnet     = (@($t.ipc | ForEach-Object { "$($_.properties.subnet.id)".Split('/')[-1] } | Select-Object -Unique) -join ',')
+        Nsg        = ($t.Nsg -split '/')[-1]
+        LbPools    = @($t.ipc | ForEach-Object { @($_.properties.loadBalancerBackendAddressPools) | Where-Object { $_ } }).Count
     }
 }
 $rows = @($rows)
@@ -136,7 +135,8 @@ foreach ($t in $targets) {
     $live = Invoke-ArmRequest -Path "$($t.id)?api-version=$api" -IgnoreNotFound
     if (-not $live) { Write-Host "SKIP (gone): $($t.name)"; continue }
     if (Test-Attached $live) { Write-Warning "ABORT $($t.name): attached again since the report. Not deleted."; $aborted++; continue }
-    if (-not $PSCmdlet.ShouldProcess("$($t.name) ($($t.PrivateIPs))", 'Delete network interface')) { continue }
+    $ips = @($live.properties.ipConfigurations | ForEach-Object { $_.properties.privateIPAddress }) -join ','
+    if (-not $PSCmdlet.ShouldProcess("$($t.name) ($ips)", 'Delete network interface')) { continue }
     [void]$saved.Add($live)
     $saved | ConvertTo-Json -Depth 30 | Set-Content -Path $backup -Encoding utf8 -WhatIf:$false   # before the delete, every time
     try {

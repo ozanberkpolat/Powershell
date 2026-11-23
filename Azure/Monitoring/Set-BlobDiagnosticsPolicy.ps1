@@ -24,9 +24,10 @@
     Without -Apply the script only reports what it would do. With -Apply every write is guarded by
     ShouldProcess, so -Apply -WhatIf prints the plan.
 
-    UNTESTED: the remediation task call (Microsoft.PolicyInsights/remediations) and the Direct mode REST body
-    were written from Microsoft Learn; the original run used az CLI. Verify on one subscription first and
-    check the remediation task in the portal (Policy > Remediation).
+    UNTESTED: every REST call here (policy assignment, role assignments, remediation task, Direct mode
+    diagnostic setting) is a port of an az CLI run to ARM REST, and the remediation task was not in the
+    original run. Verify on one subscription first: the assignment and its identity's roles in the portal
+    (Policy > Assignments, IAM), and the remediation task (Policy > Remediation).
 
 .PARAMETER WorkspaceResourceId
     Resource ID of the target Log Analytics workspace (for Sentinel, the Sentinel workspace).
