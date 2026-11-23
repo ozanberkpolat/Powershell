@@ -1,4 +1,5 @@
 #Requires -Version 7.0
+#Requires -Modules Az.Accounts
 <#
 .SYNOPSIS
     Update a desktop application (EXE installer) on many Windows VMs through Run Command, in waves, with
