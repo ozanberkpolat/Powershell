@@ -140,14 +140,20 @@ try {
             $dat = Join-Path $path 'NTUSER.DAT'
             if (-not (Test-Path -LiteralPath $dat)) { continue }
             $tmp = 'TmpProbe_' + ($sid -replace '[^0-9]', '')
-            & reg.exe load "HKU\$tmp" "$dat" *> $null
-            if ($LASTEXITCODE -ne 0) { continue }
+            $ErrorActionPreference = 'Continue'   # 5.1: native stderr under Stop would throw
+            & reg.exe load "HKU\$tmp" "$dat" 2>&1 | Out-Null
+            $loaded = ($LASTEXITCODE -eq 0)
+            $ErrorActionPreference = 'Stop'
+            if (-not $loaded) { continue }
             try {
                 foreach ($s in $sub) { $users += @(Read-Uninstall "Registry::HKEY_USERS\$tmp\$s" "profile:$(Split-Path $path -Leaf)") }
                 $r.unloadedProfilesRead++
             } finally {
                 [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-                & reg.exe unload "HKU\$tmp" *> $null
+                $ErrorActionPreference = 'Continue'
+                & reg.exe unload "HKU\$tmp" 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) { $r.unloadFailed = "$tmp" }
+                $ErrorActionPreference = 'Stop'
             }
         }
     }
@@ -202,6 +208,7 @@ function ConvertFrom-ProbeLine([string]$vm, [string]$text) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutputFolder | Out-Null
+$OutputFolder = (Resolve-Path $OutputFolder).Path   # absolute: the read-back must not depend on the working directory
 if ($Local) {
     $out = (& ([scriptblock]::Create($guest)) | Out-String)
     $probes = @(ConvertFrom-ProbeLine $env:COMPUTERNAME $out)

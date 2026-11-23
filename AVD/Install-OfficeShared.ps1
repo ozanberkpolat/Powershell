@@ -89,10 +89,19 @@ function Result([string]$code, [string]$detail, [int]$exitCode) {
     exit $exitCode
 }
 function Test-Signature([string]$path) {
+    # Returns ONE object; printing inside a function that is used in an if() would turn the result into an
+    # array, and a non-empty array is always true.
     $sig = Get-AuthenticodeSignature -FilePath $path
     $subj = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
-    Write-Output ("setup.exe version {0}, signature {1}, signer {2}" -f (Get-Item $path).VersionInfo.FileVersion, $sig.Status, $subj)
-    ($sig.Status -eq 'Valid' -and $subj -like '*O=Microsoft Corporation*')
+    [pscustomobject]@{
+        Ok   = ($sig.Status -eq 'Valid' -and $subj -like '*O=Microsoft Corporation*')
+        Info = ("setup.exe version {0}, signature {1}, signer {2}" -f (Get-Item $path).VersionInfo.FileVersion, $sig.Status, $subj)
+    }
+}
+function Invoke-Native([scriptblock]$Command) {
+    # Windows PowerShell 5.1 turns a native stderr line into a terminating error under 'Stop'.
+    $ErrorActionPreference = 'Continue'
+    (& $Command 2>&1 | ForEach-Object { "$_" }) -join "`n"
 }
 function Get-Office {
     $u = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
@@ -102,7 +111,7 @@ function Get-Office {
 
 try {
     "=== proxy ==="
-    (& netsh.exe winhttp show proxy | Out-String).Trim()
+    (Invoke-Native { netsh.exe winhttp show proxy }).Trim()
 
     "=== DNS and TCP 443 ==="
     $cdnOk = $false
@@ -126,12 +135,12 @@ try {
 
     if ($Mode -eq 'Check') {
         "=== setup.exe ==="
-        if (Test-Path $setup) { [void](Test-Signature $setup) } else { "not present in $WorkDir (Install downloads it)" }
+        if (Test-Path $setup) { (Test-Signature $setup).Info } else { "not present in $WorkDir (Install downloads it)" }
         "=== installed Office ==="
         Get-Office
         if (Test-Path $c2rKey) { Get-ItemProperty $c2rKey | Select-Object VersionToReport, ProductReleaseIds, SharedComputerLicensing, UpdateChannel, CDNBaseUrl | Format-List | Out-String }
         "=== sessions ==="
-        (& quser.exe 2>&1 | Out-String).Trim()
+        (Invoke-Native { quser.exe }).Trim()
         "=== free space ==="
         Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{ n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } } | Format-Table -AutoSize | Out-String
         Result $(if ($cdnOk) { 'CHECKED' } else { 'CDN-UNREACHABLE' }) "cdn443=$cdnOk" $(if ($cdnOk) { 0 } else { 4 })
@@ -177,7 +186,9 @@ $excl
         try { Invoke-WebRequest -Uri "https://$cdn/pr/wsus/setup.exe" -OutFile $setup -UseBasicParsing }
         catch { Result 'DOWNLOAD-FAILED' "error=$($_.Exception.Message)" 5 }
     }
-    if (-not (Test-Signature $setup)) {
+    $sigCheck = Test-Signature $setup
+    $sigCheck.Info
+    if (-not $sigCheck.Ok) {
         Remove-Item $setup -Force
         Result 'BAD-SIGNATURE' 'setup.exe deleted, install not started' 3
     }

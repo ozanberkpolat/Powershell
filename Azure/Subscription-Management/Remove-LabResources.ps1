@@ -101,6 +101,14 @@ if (-not $ctx) { throw 'No Az context. Run Connect-AzAccount and Set-AzContext t
 $subId = $ctx.Subscription.Id
 $subScope = "/subscriptions/$subId"
 $errors = [System.Collections.Generic.List[string]]::new()
+# The signed-in principal's own assignments are kept: removing them first would 403 the later deletes.
+$me = $null
+try { $me = (Get-AzADUser -SignedIn -ErrorAction Stop).Id } catch { $me = $null }
+if (-not $me) { Write-Warning 'Could not resolve the signed-in user object ID; review step 2 so your own access is not removed.' }
+function Invoke-Section([string]$Name, [scriptblock]$Body) {
+    # Every section runs on: a read that fails is recorded and the next section still runs.
+    try { & $Body } catch { $errors.Add("section '$Name': $_"); Write-Warning "  section '$Name' failed: $_" }
+}
 
 function Step([string]$Target, [string]$Action, [scriptblock]$Work) {
     if (-not $Apply) { Write-Host "  [plan] $Action" -ForegroundColor DarkGray; return $true }
@@ -131,6 +139,7 @@ foreach ($rg in $targets) {
 $skipRg = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
 # ---- 1. locks ---------------------------------------------------------------------------------------
+Invoke-Section '1 locks' {
 Write-Host "`n1. Locks"
 foreach ($rg in $targets) {
     foreach ($l in @(Get-AzResourceLock -ResourceGroupName $rg.ResourceGroupName)) {
@@ -138,16 +147,18 @@ foreach ($rg in $targets) {
     }
 }
 
+}
 # ---- 2. role assignments --------------------------------------------------------------------------
+Invoke-Section '2 role assignments' {
 Write-Host "`n2. Role assignments"
 $scopes = @($targets | ForEach-Object { $_.ResourceId })
 foreach ($scope in $scopes) {
-    foreach ($a in @(Get-AzRoleAssignment -Scope $scope | Where-Object { $_.Scope -eq $scope })) {
+    foreach ($a in @(Get-AzRoleAssignment -Scope $scope | Where-Object { $_.Scope -eq $scope -and $_.ObjectId -ne $me })) {
         $null = Step $scope "remove $($a.RoleDefinitionName) for $($a.DisplayName) ($($a.ObjectType))" { Remove-AzRoleAssignment -InputObject $a }
     }
     # time-bound (PIM) assignments: end them with an AdminRemove schedule request
     $inst = @(Invoke-Arm -Path "$scope/providers/Microsoft.Authorization/roleAssignmentScheduleInstances" -ApiVersion '2020-10-01')
-    foreach ($i in $inst | Where-Object { $_.properties.endDateTime -and $_.properties.scope -eq $scope }) {
+    foreach ($i in $inst | Where-Object { $_.properties.endDateTime -and $_.properties.scope -eq $scope -and $_.properties.principalId -ne $me }) {
         $p = $i.properties
         $body = @{ properties = @{ principalId = $p.principalId; roleDefinitionId = $p.roleDefinitionId; requestType = 'AdminRemove'; justification = 'lab teardown' } }
         $null = Step $scope "end time-bound role $($p.roleDefinitionId.Split('/')[-1]) for $($p.principalId)" {
@@ -160,7 +171,9 @@ foreach ($oid in $PrincipalObjectId) {
     }
 }
 
+}
 # ---- 3. Recovery Services vaults ------------------------------------------------------------------
+Invoke-Section '3 vaults' {
 Write-Host "`n3. Recovery Services vaults"
 foreach ($rg in $targets) {
     $vaultIds = @(Get-AzResource -ResourceGroupName $rg.ResourceGroupName -ResourceType 'Microsoft.RecoveryServices/vaults' | ForEach-Object ResourceId)
@@ -201,7 +214,9 @@ foreach ($rg in $targets) {
     }
 }
 
+}
 # ---- 4. subscription diagnostic setting and workspace -----------------------------------------------
+Invoke-Section '4 diagnostics' {
 Write-Host "`n4. Diagnostic setting and workspace"
 if ($SubscriptionDiagnosticSetting) {
     $ds = Invoke-ArmRequest -Path "$subScope/providers/Microsoft.Insights/diagnosticSettings/$($SubscriptionDiagnosticSetting)?api-version=2021-05-01-preview" -IgnoreNotFound
@@ -214,7 +229,9 @@ if ($WorkspaceResourceId) {
     else { Write-Host '  workspace not found' }
 }
 
+}
 # ---- 5. policy assignments and budgets -------------------------------------------------------------
+Invoke-Section '5 policies and budgets' {
 Write-Host "`n5. Policy assignments and budgets"
 foreach ($rg in $targets) {
     $scope = $rg.ResourceId
@@ -226,12 +243,14 @@ foreach ($rg in $targets) {
     }
 }
 
+}
 # ---- 6. resource groups --------------------------------------------------------------------------
 Write-Host "`n6. Resource groups"
 $deleting = @()
 foreach ($rg in $targets) {
     if ($skipRg.Contains($rg.ResourceGroupName)) { Write-Warning "  skipping $($rg.ResourceGroupName) (see above)"; continue }
-    if (Step $rg.ResourceGroupName "delete resource group $($rg.ResourceGroupName)" { Remove-AzResourceGroup -Name $rg.ResourceGroupName -Force -AsJob }) { $deleting += $rg.ResourceGroupName }
+    # ARM DELETE answers 202 and keeps going server side, so -NoWait is safe (a background job would die with the process).
+    if (Step $rg.ResourceGroupName "delete resource group $($rg.ResourceGroupName)" { Invoke-ArmRequest -Method DELETE -Path "$($rg.ResourceId)?api-version=2021-04-01" }) { $deleting += $rg.ResourceGroupName }
 }
 if ($Apply -and $deleting.Count -and -not $NoWait) {
     $deadline = (Get-Date).AddMinutes($WaitMinutes)
@@ -241,10 +260,11 @@ if ($Apply -and $deleting.Count -and -not $NoWait) {
         Write-Host ("  waiting ({0:HH:mm}): {1}" -f (Get-Date), ($left -join ', '))
         Start-Sleep -Seconds 60
     } while ((Get-Date) -lt $deadline)
-    if ($left.Count) { $errors.Add("not deleted after $WaitMinutes min: $($left -join ', ') (check Get-Job and the Activity Log)") }
+    if ($left.Count) { $errors.Add("not deleted after $WaitMinutes min: $($left -join ', ') (check the Activity Log)") }
 }
 
 # ---- 7. custom roles --------------------------------------------------------------------------------
+Invoke-Section '7 custom roles' {
 Write-Host "`n7. Custom roles"
 foreach ($name in $CustomRoleName) {
     $def = Get-AzRoleDefinition -Name $name -ErrorAction SilentlyContinue
@@ -258,6 +278,7 @@ foreach ($name in $CustomRoleName) {
     }
 }
 
+}
 if ($errors.Count) {
     Write-Host "`n$($errors.Count) ERROR(S):" -ForegroundColor Red
     $errors | ForEach-Object { Write-Host "  - $_" }

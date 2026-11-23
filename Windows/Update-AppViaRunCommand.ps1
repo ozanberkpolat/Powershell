@@ -380,6 +380,8 @@ if ($PSCmdlet.ParameterSetName -eq 'ByCsv') {
 }
 
 New-Item -ItemType Directory -Force -Path $OutputFolder | Out-Null
+$OutputFolder = (Resolve-Path $OutputFolder).Path
+$gateStopped = $false
 function Get-StatusCode([string]$text) {
     $line = ($text -split "`r?`n" | Where-Object { $_ -like 'STATUS=*' } | Select-Object -First 1)
     if (-not $line) { return @('NO-STATUS-RETURNED', '') }
@@ -430,6 +432,7 @@ for ($i = 0; $i -lt $waveNames.Count; $i++) {
     $bad = @($rows | Where-Object { $_.Code -notin $gate })
     if ($bad.Count -and $i -lt $waveNames.Count - 1) {
         Write-Warning ("GATE STOP after wave '{0}': {1}" -f $wave, (($bad | ForEach-Object { "$($_.Vm)=$($_.Code)" }) -join ', '))
+        $gateStopped = $true
         break
     }
 }
@@ -440,3 +443,4 @@ Write-Host "Output: $OutputFolder" -ForegroundColor Cyan
 $failCodes = 'FAIL-VERSION', 'FAIL-SHELLEXT', 'FAIL-OPENCMD', 'REPAIR-UNVERIFIED', 'FAILED', 'NO-STATUS-RETURNED', 'CHUNK-FAILED', 'INVOKE-FAILED'
 $failed = @($all | Where-Object { $_.Code -in $failCodes -or $_.Code -like 'RUNCOMMAND-*' })
 if ($failed.Count) { Write-Error "$($failed.Count) VM(s) failed: $($failed.Vm -join ', ')" -ErrorAction Continue; exit 1 }
+if ($gateStopped) { Write-Error 'Stopped at a wave gate: later waves were not run.' -ErrorAction Continue; exit 1 }

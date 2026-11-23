@@ -43,11 +43,18 @@
     VM name regex for pooled session hosts (drafted No: rebuilt from an image). Default '(?i)^(avd|vdi|sh)-'.
 .PARAMETER RestoreTestPattern
     Resource group regex for restore and failover test environments (drafted No). Default '(?i)restore-?test'.
-.PARAMETER BackupTag, ReplicationTag, BackupPolicyTag, MaintenanceTag
-    Tag names read from VMs as protection signals. Defaults BackupEnabled, ReplicationEnabled, BackupPolicy,
-    MaintenanceConfiguration. A tag value of Yes counts.
-.PARAMETER EnvironmentTag, CriticalityTag
-    Classification tag names. Defaults Environment, Criticality.
+.PARAMETER BackupTag
+    VM tag that says Azure Backup protects it (value Yes counts). Default BackupEnabled.
+.PARAMETER BackupPolicyTag
+    VM tag with the backup policy name, shown as-is. Default BackupPolicy.
+.PARAMETER ReplicationTag
+    VM tag that says Site Recovery replicates it (value Yes counts). Default ReplicationEnabled.
+.PARAMETER MaintenanceTag
+    VM tag with the maintenance configuration, shown as-is. Default MaintenanceConfiguration.
+.PARAMETER EnvironmentTag
+    Classification tag name for the environment. Default Environment.
+.PARAMETER CriticalityTag
+    Classification tag name for criticality. Default Criticality.
 .PARAMETER OrganizationName
     Name shown on the Overview sheet and in the file properties. Default 'the organization'.
 .PARAMETER OutputPath

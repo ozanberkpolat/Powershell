@@ -89,6 +89,11 @@ function Result([string]$code, [string]$detail, [int]$exitCode) {
     Add-Content -Path $EvidencePath -Value $line -Encoding UTF8
     exit $exitCode
 }
+function Invoke-Native([scriptblock]$Command) {
+    # Windows PowerShell 5.1 turns a native stderr line into a terminating error under 'Stop'.
+    $ErrorActionPreference = 'Continue'
+    @(& $Command 2>&1 | ForEach-Object { "$_" })
+}
 function Get-BadComponents {
     @(Get-ServerComponentState -Identity $srv | Where-Object { $_.State -ne 'Active' -and $ExpectedInactiveComponents -notcontains $_.Component })
 }
@@ -162,7 +167,7 @@ try {
             $dirty = @()
             foreach ($db in $dbs) {
                 $edb = $db.EdbFilePath.PathName
-                $hit = & $eseutil /mh "$edb" 2>&1 | Select-String -Pattern '^\s*State:'
+                $hit = Invoke-Native { & $eseutil /mh "$edb" } | Select-String -Pattern '^\s*State:'
                 $state = if ($hit) { $hit[0].ToString().Trim() } else { 'State: UNKNOWN (no State line from eseutil)' }
                 Say "$($db.Name) -> $state"
                 if ($state -notmatch 'Clean Shutdown') { $dirty += $db.Name }

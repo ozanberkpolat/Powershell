@@ -124,7 +124,10 @@ try {
     if ($l.Disk.PartitionStyle -eq 'MBR') { Say 'NOTE: MBR disk, a partition is capped at 2 TB.' }
 
     if ($Mode -eq 'Assess') {
-        Dump 'WinRE' (& reagentc.exe /info 2>&1)
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'   # 5.1: native stderr under Stop would throw
+        $winre = @(& reagentc.exe /info 2>&1 | ForEach-Object { "$_" })
+        $ErrorActionPreference = $prev
+        Dump 'WinRE' $winre
         $pend = [ordered]@{
             CbsRebootPending  = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
             WuRebootRequired  = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'

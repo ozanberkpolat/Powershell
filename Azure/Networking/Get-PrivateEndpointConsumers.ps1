@@ -44,6 +44,8 @@
 .NOTES
     Role: Reader on the subscriptions; Log Analytics Reader on the Traffic Analytics workspace.
     Modules: Az.Accounts (Resource Graph and Log Analytics through Azure/Common/Az-Helpers.ps1).
+    UNTESTED: sections B (manual-approval connections, NIC IP join), C (NSG rules) and D (route containment) are
+    new; only the subnet and endpoint inventory queries ran in the source. Spot-check them against the portal.
     UNTESTED: section E as one query (the source ran one query per subnet range with ipv4_is_in_range); verify the
     mv-apply attribution on a workspace with Traffic Analytics before relying on per-subnet counts.
     Traps kept from real use:
@@ -115,7 +117,7 @@ $qB = @"
 resources
 | where type =~ 'microsoft.network/privateendpoints' $locFilter
 | extend subnetId = tolower(tostring(properties.subnet.id)), nicId = tolower(tostring(properties.networkInterfaces[0].id))
-| extend conns = array_concat(properties.privateLinkServiceConnections, properties.manualPrivateLinkServiceConnections)
+| extend conns = iff(array_length(properties.privateLinkServiceConnections) > 0, properties.privateLinkServiceConnections, properties.manualPrivateLinkServiceConnections)
 | mv-expand c = conns
 | project name, resourceGroup, subscriptionId, subnetId, nicId, groupId = tostring(c.properties.groupIds[0]),
     target = tostring(c.properties.privateLinkServiceId), state = tostring(c.properties.privateLinkServiceConnectionState.status)

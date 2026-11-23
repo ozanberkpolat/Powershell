@@ -65,6 +65,7 @@
       - Guests have an #EXT# UPN in the tenant; a lookup by their home UPN fails, so mail is tried as well.
       - A budget start date must be the first day of a month and not before the current month.
       - Policy assignments on a resource group take a few minutes to apply; test a denied deployment after.
+      - "...-$name?api-version" in a PowerShell string swallows the '?' into the variable name; write $($name)?.
       - A dry run must not report "applied": the summary says "would create" until -Apply is given.
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium', DefaultParameterSetName = 'ByFile')]
@@ -167,7 +168,7 @@ foreach ($upn in $upns) {
         $row.Policy = ($pol | Sort-Object -Unique) -join ','
 
         # 4. budget on the resource group
-        $bPath = "$rgScope/providers/Microsoft.Consumption/budgets/budget-$name?api-version=2023-05-01"
+        $bPath = "$rgScope/providers/Microsoft.Consumption/budgets/budget-$($name)?api-version=2023-05-01"
         $bExists = if ($rgReady) { Invoke-ArmRequest -Path $bPath -IgnoreNotFound } else { $null }
         $row.Budget = if ($bExists) { 'exists' } else {
             $start = (Get-Date -Day 1).ToString('yyyy-MM-01T00:00:00Z')   # first day of the current month

@@ -66,6 +66,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $problems = @()
+function Invoke-Native([scriptblock]$Command) {
+    # Windows PowerShell 5.1 turns a native stderr line (curl -sS on a dead endpoint) into a terminating
+    # error under 'Stop'; keep it as text instead.
+    $ErrorActionPreference = 'Continue'
+    ((& $Command 2>&1 | ForEach-Object { "$_" }) -join "`n").Trim()
+}
 
 "=== 1. curl.exe probes (native TLS, not .NET) ==="
 $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
@@ -77,14 +83,15 @@ if (-not (Test-Path $curl)) {
     foreach ($h in $hosts) {
         foreach ($path in ($ExpectedCodes.Keys | Sort-Object)) {
             $u = "https://$h$path"
-            $code = (& $curl -sS -k -m 25 -o NUL -w '%{http_code}' $u 2>&1 | Out-String).Trim()
+            $out = Invoke-Native { & $curl -sS -k -m 25 -o NUL -w '%{http_code}' $u }
+            $code = if ($out -match '(?m)^(\d{3})\s*$') { $Matches[1] } else { "ERR($($out -replace '\s+', ' '))" }
             $ok = $ExpectedCodes[$path] -contains $code
             '{0,-6} {1,-4} {2}' -f $(if ($ok) { 'ok' } else { 'BAD' }), $code, $u
             if (-not $ok) { $problems += "$h$path=$code" }
         }
     }
     "--- healthcheck.htm body (localhost) ---"
-    (& $curl -sS -k -m 25 'https://localhost/owa/healthcheck.htm' 2>&1 | Out-String).Trim()
+    Invoke-Native { & $curl -sS -k -m 25 'https://localhost/owa/healthcheck.htm' }
 }
 
 Import-Module WebAdministration -ErrorAction SilentlyContinue
