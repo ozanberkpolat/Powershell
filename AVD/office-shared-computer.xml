@@ -1,0 +1,38 @@
+<!--
+  Office Deployment Tool (ODT) configuration: Microsoft 365 Apps with shared computer activation,
+  for AVD session hosts and RDS servers. Use with:  setup.exe /configure office-shared-computer.xml
+  AVD/Install-OfficeShared.ps1 can generate the same file with parameters.
+
+  Choices (change to fit):
+    - 64-bit, Monthly Enterprise Channel (Microsoft's sample for AVD).
+    - Language: en-US plus the OS language (MatchOS).
+    - Excluded: Groove (old OneDrive for Business), Lync (Skype for Business, unsupported on AVD),
+      OneDrive (install it per machine instead, see the AVD docs), Teams (install the new Teams per machine),
+      Bing. Add Outlook / Access / Publisher / OneNote if the users do not need them.
+    - RemoveMSI: removes older MSI-based Office first; Click-to-Run and MSI Office cannot coexist.
+    - Updates Enabled="FALSE": for pooled hosts rebuilt from an image (update the image, redeploy).
+      On a long-lived host that is never reimaged, set TRUE or Office never updates.
+    - FORCEAPPSHUTDOWN FALSE: safe on a host with signed-in users (setup fails instead of closing their
+      Office apps). Use TRUE only while building an image.
+    - SharedComputerLicensing 1: per-user activation tokens; each user needs a Microsoft 365 Apps licence.
+  Reference: https://learn.microsoft.com/azure/virtual-desktop/install-office-on-wvd-master-image
+-->
+<Configuration>
+  <Add OfficeClientEdition="64" Channel="MonthlyEnterprise">
+    <Product ID="O365ProPlusRetail">
+      <Language ID="en-us" />
+      <Language ID="MatchOS" />
+      <ExcludeApp ID="Groove" />
+      <ExcludeApp ID="Lync" />
+      <ExcludeApp ID="OneDrive" />
+      <ExcludeApp ID="Teams" />
+      <ExcludeApp ID="Bing" />
+    </Product>
+  </Add>
+  <RemoveMSI />
+  <Updates Enabled="FALSE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Logging Level="Standard" Path="C:\ODT\Logs" />
+  <Property Name="FORCEAPPSHUTDOWN" Value="FALSE" />
+  <Property Name="SharedComputerLicensing" Value="1" />
+</Configuration>
