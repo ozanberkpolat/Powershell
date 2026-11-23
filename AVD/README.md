@@ -67,3 +67,33 @@ AVD session hosts need outbound access to these endpoints. Microsoft does not pu
 | RDP Shortpath (TURN) | UDP 3478 | Microsoft TURN relay range for your region |
 
 Per host pool subnet standard that worked: a dedicated small subnet with its own NSG (inbound only RDP Shortpath UDP 3390 from the VNet, AzureLoadBalancer, then Deny All), a route table sending default and internal ranges to the firewall, and the AVD platform policy listed above placed above the general internet policy, with no web filter and no SSL deep inspection. Watch the firewall log for denied traffic from the new subnet after the first host registers (typical misses: UDP 3478, TCP 1688, and a blocked `enterpriseregistration.windows.net`). Computer objects must be in an OU inside Entra Connect sync scope.
+
+## More SSO, Kerberos and FSLogix notes
+
+Additions to the lessons above; read them together.
+
+### SSO: finding the service principals and checking the result
+- Graph scopes: `Application.Read.All` and `Application-RemoteDesktopConfig.ReadWrite.All`; Entra role Application Administrator or Cloud Application Administrator; Microsoft Graph PowerShell SDK 2.9.0 or later.
+- Look the service principals up by their well-known first-party app IDs (the same in every tenant):
+  ```powershell
+  $wclSpId  = (Get-MgServicePrincipal -Filter "AppId eq '270efc09-cd0d-444b-a71f-39af4910ec45'").Id  # Windows Cloud Login
+  $msRdSpId = (Get-MgServicePrincipal -Filter "AppId eq 'a4a365df-50f1-4397-bc59-1a1564b8bb9c'").Id  # Microsoft Remote Desktop
+  Get-MgServicePrincipalRemoteDesktopSecurityConfiguration -ServicePrincipalId $wclSpId   # IsRemoteDesktopProtocolEnabled : True
+  ```
+  Current Microsoft Learn lists only Windows Cloud Login as required; older guidance enabled both, which is harmless. When the configuration object already exists, `New-...` fails: use `Update-MgServicePrincipalRemoteDesktopSecurityConfiguration -ServicePrincipalId $wclSpId -IsRemoteDesktopProtocolEnabled`. The portal path is Entra ID > Devices > Remote connection configuration.
+- The consent prompt is hidden with up to 10 target device groups on Windows Cloud Login (`New-MgServicePrincipalRemoteDesktopSecurityConfigurationTargetDeviceGroup`). A dynamic device group is the usual choice; it can take up to 24 hours to fill in large tenants.
+- SSO on hybrid-joined hosts WITHOUT the Kerberos server object shows up as "the specific session doesn't exist" or as a normal password prompt (SSO silently skipped), not as a clear error.
+- Hosts in a different AD domain than the users need a two-way trust, otherwise connections fall back to older authentication.
+- SSO adds Windows Cloud Login as a new cloud app for Conditional Access: review policies that target Azure Virtual Desktop so they also cover it.
+
+### Kerberos for privileged accounts
+- The admin failure looks like a Conditional Access problem (sign-in error 70046, "MFA claim has expired") and does not go away with CA disabled, new tokens or revoked sessions. If only members of Protected Users or of privileged AD groups fail, stop debugging CA: it is the Cloud Kerberos Trust exclusion described above. The cloud partial TGT is refused by the writable domain controller for these accounts.
+
+### FSLogix and file transfer
+- `icacls` on a German (or other non-English) OS needs the localised group names (for example `VORDEFINIERT\Administratoren`, `ERSTELLER-BESITZER`); well-known SIDs avoid the problem: `*S-1-5-32-544` (Administrators), `*S-1-3-0` (CREATOR OWNER), `*S-1-5-32-545` (Users).
+- When the clipboard-only export cannot carry files on a client, fall back to a controlled channel (OneDrive or a dedicated share with auditing) rather than turning drive redirection back on.
+- After changing the clipboard or redirection GPOs: `gpupdate /force` on the host, restart the Remote Desktop Services service (`TermService`, which disconnects sessions) or sign the users out, then connect again and test.
+- Edge automatic client certificate selection value format (one JSON string per entry): `{"pattern":"https://app.contoso.com","filter":{"ISSUER":{"CN":"Contoso Issuing CA"}}}`.
+
+### Scheduled restart
+- "Session host update" in AVD redeploys hosts from a new image or configuration; it is not a recurring restart. Use the Automation runbook described above.
