@@ -114,7 +114,7 @@ if ($Stage -eq 'Items') {
     if ($notReady.Count -gt 0) {
         throw "REFUSED: port(s) $($notReady -join ', ') are not reporting 1 yet (item missing, never ran, or not listening); the trigger(s) would fire on create. Run the Items stage, wait for a check, and confirm the service listens."
     }
-    $existing = @(Invoke-ZabbixApi -Method trigger.get -AllowEmpty -Params @{ hostids = $hostId; output = @('description') } | ForEach-Object { $_.description })
+    $existing = @((Invoke-ZabbixApi -Method trigger.get -AllowEmpty -Params @{ hostids = $hostId; output = @('description') }) | ForEach-Object { $_.description })
     $new = @($Port | Where-Object { $existing -notcontains "${Label}: Port $_ is not listening" } | ForEach-Object {
         @{ description = "${Label}: Port $_ is not listening"
            expression = "max(/$($hostRow.host)/$(Get-Key $_),#$ConsecutiveChecks)=0"

@@ -18,6 +18,10 @@ Set `ZABBIX_URL` and `ZABBIX_TOKEN_FILE` once to drop `-Url` and `-TokenFile` fr
 | `Get-ZabbixHostAvailability.ps1` | read | Quarterly availability evidence for one host: hourly `agent.ping` gaps, boot times, peer check on the same proxy, trigger and proxy events |
 | `New-ZabbixPortChecks.ps1` | **write** | `net.tcp.listen` items, then High triggers per port. Two stages, refuses to create triggers for ports not yet reporting 1. `-WhatIf` supported |
 | `Set-ZabbixWebScenarioAlerting.ps1` | **write** | Required status code + tags on a web scenario, then a High trigger on N failed runs. `-WhatIf` supported |
+| `Get-ZabbixMonthlyBundle.ps1` | read | Monthly bundle: hosts, chosen items, VM trends, web scenario items and trends as CSV plus `manifest.json`, cut on whole months in a given time zone (DST-safe). Uses the four scripts above |
+| `Set-ZabbixServiceTree.ps1` | **write** | Business service tree from a JSON file: problem-tag leaves, parents = most critical child, existing nodes kept. `-WhatIf` supported |
+| `Set-ZabbixHostTags.ps1` | **write** | Merges business-service tags into hosts (host.update replaces the list), environment tag census against PROD/NONPROD templates, optional reconcile. `-WhatIf` supported |
+| `New-ZabbixTenantReadOnlyRole.ps1` | **write** | Role that sees only services tagged for one tenant, users moved onto it, optional user group, optional removal of service read from shared roles. `-WhatIf` supported |
 
 ## Typical flow: monthly utilisation and uptime data
 
@@ -48,3 +52,35 @@ Availability evidence for one host: `.\Get-ZabbixHostAvailability.ps1 @z -HostNa
 - **Trigger expressions use the technical host name** (`host`), not the visible name.
 - **Proxy field name** is `proxyid` on 7.0+ and `proxy_hostid` on 6.4. The availability script handles both.
 - **Everything is idempotent.** Existing items and triggers are skipped, and before/after JSON evidence goes to `.\evidence`.
+
+## Monthly report bundle
+
+```powershell
+.\Get-ZabbixMonthlyBundle.ps1 @z -VmGroupName 'Contoso-Servers' -WebGroupName 'Contoso-Websites' -TimeZone 'Eastern Standard Time' -Zip
+```
+
+Writes `zabbix-bundle-<yyyy-MM>\` with `hosts.csv`, `items.csv`, `vm-trends.csv`, `web.csv`, `web-trends.csv` and
+`manifest.json` (window, time zone, groups, row counts). The collector only fetches and selects; how the rows become a
+report (business hours, thresholds, availability, sizing verdicts) is documented in [`report-rules.md`](report-rules.md).
+
+## Business service tree for one tenant
+
+Order matters: problem tags come from host, item and trigger tags, so tag first, then build the tree, then scope a role to it.
+
+```powershell
+.\Set-ZabbixHostTags.ps1 @z -TagFile .\examples\host-tags.example.csv -CensusGroupName 'Contoso-Servers' -WhatIf
+.\Set-ZabbixServiceTree.ps1 @z -DefinitionFile .\examples\service-tree.example.json -WhatIf
+.\New-ZabbixTenantReadOnlyRole.ps1 @z -RoleName 'Contoso Read Only' -TemplateRoleName 'Read-only user' -ServiceTagValue contoso -UserName 'contoso.viewer' -WhatIf
+```
+
+Drop `-WhatIf` to apply. Examples: [`examples/service-tree.example.json`](examples/service-tree.example.json),
+[`examples/host-tags.example.csv`](examples/host-tags.example.csv).
+
+More traps:
+
+- **host.update replaces the whole tag list**, and sending back AUTOMATIC (discovered) tags turns them into manual ones. The tag script merges and refuses when automatic tags are present.
+- **"PROD" is a substring of "NONPROD"**: the template-to-environment map is matched in order, longer pattern first.
+- **role.update with a partial rules object resets the rest.** The role script reads the full rules and changes only the `services.*` keys. `readonly` is returned by role.get but cannot be sent.
+- **Service access by tag includes child services**: tag the tenant's root service, not every leaf.
+- **A parent that was not created has no id**: in `-WhatIf` its children are listed as planned and never looked up as roots.
+- **Windows hosts have no `system.boottime`** and `system.uptime` keeps no trends: the availability script then takes reboots from the restart trigger, with a look-back before the period for the starting boot.

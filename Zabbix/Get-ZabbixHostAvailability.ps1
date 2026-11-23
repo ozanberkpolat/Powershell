@@ -8,12 +8,18 @@
       1. agent.ping trend per hour: `num` is the number of samples that hour (60 expected at a 1 minute interval).
          Hours with fewer samples are "short hours"; the missing samples approximate the minutes the host did not report.
       2. system.boottime trend: a changed value between hours marks a reboot (the value is the boot time, epoch).
+         Windows templates have no system.boottime, and system.uptime usually keeps no trends (short history only).
+         For such hosts the reboots come from the "has been restarted" trigger events instead, plus a look-back
+         window before the period that finds the boot the period starts from.
       3. Peer check: for every short hour, how many other hosts monitored through the SAME proxy were also short or
          silent. If most peers are short too, the gap is a platform, proxy or network problem, not a host outage.
       4. Trigger events for the agent-unavailable and restarted triggers, and server events that mention the proxy.
+      5. Platform events around every short hour (from 30 minutes before to 90 minutes after) whose name mentions
+         the proxy, the Zabbix server or a version change: the evidence for the "cause" column of a gap table.
     Everything is written to one JSON evidence file; a summary object is returned.
 
-    Loud failures: the host must exist exactly once, both items must exist, and both trends must be non-empty.
+    Loud failures: the host must exist exactly once, agent.ping must exist, and every trend fetched must be non-empty;
+    a host without system.boottime must have a restart trigger and a restart event in the look-back window.
     Missing triggers (template renamed) give a warning, not silence.
 
 .PARAMETER HostName
@@ -33,6 +39,13 @@
 
 .PARAMETER TriggerSearch
     Trigger description fragments for agent-unavailable and restart events. Defaults are the standard template names.
+
+.PARAMETER BootLookbackDays
+    Days before From searched for restart events when the host has no system.boottime item. Default 40.
+    Zero restarts in that window is an error: without it the period has no known starting boot.
+
+.PARAMETER PlatformEventSearch
+    Event name fragments collected around each short hour. Default: proxy, Zabbix server, Version has changed.
 
 .PARAMETER OutFile
     Evidence JSON path. Default: .\availability-<host>-<yyyyMMdd>.json.
@@ -56,6 +69,8 @@ param(
     [int]$ExpectedPerHour = 60,
     [double]$PeerShare = 0.5,
     [string[]]$TriggerSearch = @('Zabbix agent is not available', 'has been restarted'),
+    [ValidateRange(1, 365)][int]$BootLookbackDays = 40,
+    [string[]]$PlatformEventSearch = @('proxy', 'Zabbix server', 'Version has changed'),
     [string]$OutFile,
     [string]$Url,
     [string]$TokenFile,
@@ -78,8 +93,10 @@ function Get-Trends($ItemIds, [long]$T0, [long]$T1) {
     $out
 }
 function Get-Events($Params) {
-    Invoke-ZabbixApi -Method event.get -AllowEmpty -Params ($Params + @{ source = 0; object = 0
-        output = @('eventid', 'clock', 'value', 'name', 'r_eventid'); sortfield = @('clock') })
+    # Assign, then emit: Invoke-ZabbixApi returns ONE array object, and @(Get-Events) must see the rows, not a nested array.
+    $r = Invoke-ZabbixApi -Method event.get -AllowEmpty -Params ($Params + @{ source = 0; object = 0
+        output = @('eventid', 'clock', 'value', 'name', 'r_eventid', 'objectid'); sortfield = @('clock') })
+    $r
 }
 
 # Floor to the hour so every bucket lines up with Zabbix's hourly trend clock.
@@ -97,13 +114,19 @@ foreach ($f in 'proxyid', 'proxy_hostid') {
 
 $itemRows = Invoke-ZabbixApi -Method item.get -Params @{ hostids = $hostRow.hostid; filter = @{ key_ = @('system.boottime', 'agent.ping') }; output = @('itemid', 'key_', 'delay', 'trends', 'history') }
 $items = @{}; foreach ($i in $itemRows) { $items[[string]$i.key_] = $i }
-foreach ($k in 'system.boottime', 'agent.ping') { if (-not $items.ContainsKey($k)) { throw "Item $k is missing on $HostName (found: $($items.Keys -join ', '))." } }
+if (-not $items.ContainsKey('agent.ping')) { throw "Item agent.ping is missing on $HostName (found: $($items.Keys -join ', '))." }
+# Windows templates have no system.boottime: reboots then come from the restart trigger (see below), never silence.
+$hasBoot = $items.ContainsKey('system.boottime')
+if (-not $hasBoot) { Write-Warning "No system.boottime item on $HostName (typical for Windows): reboots are taken from the restart trigger events." }
 if ($items['agent.ping'].delay -ne '1m' -and $ExpectedPerHour -eq 60) {
     Write-Warning "agent.ping delay is '$($items['agent.ping'].delay)', not 1m: the expected 60 samples per hour is probably wrong. Set -ExpectedPerHour."
 }
 
-$boot = @(Get-Trends @($items['system.boottime'].itemid) $t0 $t1)
-if ($boot.Count -eq 0) { throw 'EMPTY RESULT: system.boottime trends in the period (trend storage 0, or the period is older than retention).' }
+$boot = @()
+if ($hasBoot) {
+    $boot = @(Get-Trends @($items['system.boottime'].itemid) $t0 $t1)
+    if ($boot.Count -eq 0) { throw 'EMPTY RESULT: system.boottime trends in the period (trend storage 0, or the period is older than retention).' }
+}
 $ping = @(Get-Trends @($items['agent.ping'].itemid) $t0 $t1)
 if ($ping.Count -eq 0) { throw 'EMPTY RESULT: agent.ping trends in the period (trend storage 0, or the period is older than retention).' }
 
@@ -121,7 +144,7 @@ if ($proxyId) {
     $peers = Invoke-ZabbixApi -Method host.get -Params @{ proxyids = $proxyId; output = @('hostid', 'host'); filter = @{ status = '0' } }
     $peerIds = @($peers | Where-Object { $_.hostid -ne $hostRow.hostid } | ForEach-Object { $_.hostid })
     if ($peerIds.Count -gt 0) {
-        $peerItems = @(Invoke-ZabbixApi -Method item.get -AllowEmpty -Params @{ hostids = $peerIds; filter = @{ key_ = 'agent.ping' }; output = @('itemid', 'hostid') })
+        $peerItems = @((Invoke-ZabbixApi -Method item.get -AllowEmpty -Params @{ hostids = $peerIds; filter = @{ key_ = 'agent.ping' }; output = @('itemid', 'hostid') }))
     }
     if ($peerItems.Count -eq 0) { Write-Warning 'No peer agent.ping items on the same proxy: the host-versus-platform split is not available.' }
     elseif ($short.Count -gt 200) { Write-Warning "$($short.Count) short hours: the peer check issues one query per hour and will be slow." }
@@ -147,10 +170,29 @@ if ($proxyId) {
 }
 
 # Triggers and events
-$trigRows = @(Invoke-ZabbixApi -Method trigger.get -AllowEmpty -Params @{ hostids = $hostRow.hostid; output = @('triggerid', 'description', 'expression'); expandExpression = $true
-    search = @{ description = $TriggerSearch }; searchByAny = $true })
+$trigRows = @((Invoke-ZabbixApi -Method trigger.get -AllowEmpty -Params @{ hostids = $hostRow.hostid; output = @('triggerid', 'description', 'expression'); expandExpression = $true
+    search = @{ description = $TriggerSearch }; searchByAny = $true }))
 if ($trigRows.Count -eq 0) { Write-Warning "No triggers matching: $($TriggerSearch -join ' | '). Event evidence is empty (template renamed?)." }
 $trigEvents = if ($trigRows.Count) { @(Get-Events @{ objectids = @($trigRows | ForEach-Object { $_.triggerid }); time_from = $t0; time_till = $t1 - 1 }) } else { @() }
+$restartTrig = @($trigRows | Where-Object { $_.description -like '*restarted*' })
+$restartBefore = @()
+if (-not $hasBoot) {
+    if ($restartTrig.Count -eq 0) { throw "No system.boottime item and no 'has been restarted' trigger on ${HostName}: reboots cannot be shown." }
+    # Problem events only (value 1): each restart also logs a recovery minutes later, which is not a boot.
+    $restartBefore = @(Get-Events @{ objectids = @($restartTrig | ForEach-Object { $_.triggerid }); time_from = $t0 - $BootLookbackDays * 86400; time_till = $t0 - 1 } |
+        Where-Object { [string]$_.value -eq '1' })
+    if ($restartBefore.Count -eq 0) { throw "EMPTY RESULT: no restart event in the $BootLookbackDays days before the period, so the boot the period starts from is unknown. Raise -BootLookbackDays." }
+}
+# Platform events around each short hour: what the monitoring side itself reported when the gap happened.
+$platformEvents = @{}
+foreach ($h in $short) {
+    foreach ($e in @((Invoke-ZabbixApi -Method event.get -AllowEmpty -Params @{ source = 0; object = 0
+                time_from = [long]$h - 1800; time_till = [long]$h + 5400; search = @{ name = $PlatformEventSearch }; searchByAny = $true
+                output = @('eventid', 'clock', 'value', 'name'); selectHosts = @('host'); sortfield = @('clock') }))) {
+        $platformEvents[[string]$e.eventid] = $e
+    }
+}
+$platformEvents = @($platformEvents.Values | Sort-Object { [long]$_.clock })
 $proxyEvents = @()
 if ($proxy) {
     $proxyName = if ($proxy.PSObject.Properties.Name -contains 'name') { $proxy.name } else { $proxy.host }
@@ -160,6 +202,12 @@ if ($proxy) {
 # Reboots: boot time changes between consecutive hourly rows
 $bootSorted = @($boot | Sort-Object { [long]$_.clock })
 $bootValues = @($bootSorted | ForEach-Object { [long][double]$_.value_min; [long][double]$_.value_max } | Sort-Object -Unique)
+if (-not $hasBoot) {
+    # Restart trigger problem events (value 1) mark a boot within the trigger window (uptime < 10 min on the standard template).
+    $restartIds = @($restartTrig | ForEach-Object { [string]$_.triggerid })
+    $bootValues = @(@($restartBefore | Select-Object -Last 1) + @($trigEvents | Where-Object { $restartIds -contains [string]$_.objectid -and [string]$_.value -eq '1' }) |
+        Where-Object { $_ } | ForEach-Object { [long]$_.clock } | Sort-Object -Unique)
+}
 $reboots = @($bootValues | ForEach-Object { [DateTimeOffset]::FromUnixTimeSeconds($_).ToString('u') })
 
 $missingSamples = ($short | ForEach-Object { $ExpectedPerHour - $hours[$_] } | Measure-Object -Sum).Sum
@@ -170,7 +218,9 @@ $evidence = [ordered]@{
     items = $items; triggers = $trigRows
     pingHours = @($hours.Keys | ForEach-Object { [ordered]@{ hour = [long]$_; samples = $hours[$_] } })
     peerGapHours = $peerGap; bootValues = $reboots
-    triggerEvents = $trigEvents; proxyEvents = $proxyEvents
+    rebootSource = $(if ($hasBoot) { 'system.boottime' } else { 'restart trigger events' })
+    triggerEvents = $trigEvents; restartEventsBeforePeriod = $restartBefore; proxyEvents = $proxyEvents
+    platformEvents = $platformEvents
     extractedAt = (Get-Date).ToUniversalTime().ToString('o')
 }
 if (-not $OutFile) { $OutFile = Join-Path (Get-Location) ('availability-{0}-{1}.json' -f ($HostName -replace '[^A-Za-z0-9_.-]', '_'), (Get-Date -Format 'yyyyMMdd')) }
@@ -187,5 +237,6 @@ $evidence | ConvertTo-Json -Depth 20 | Out-File -FilePath $OutFile -Encoding utf
     DistinctBootTimes = $bootValues.Count
     TriggerEvents = $trigEvents.Count
     ProxyEvents = $proxyEvents.Count
+    PlatformEvents = $platformEvents.Count
     Evidence = $OutFile
 }

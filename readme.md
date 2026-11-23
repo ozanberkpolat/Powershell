@@ -48,10 +48,15 @@ Microsoft 365 automation — license assignment reporting.
 | **Intune/Get-IntuneAppControlStatus.ps1** | Read-only Graph probe of App Control policies, assignments and device group membership |
 | **Intune/Win32-Packaging.md** | Win32 delivery standard, Intune wizard values, MSI inspection steps |
 | **Intune/Templates/** | Generic MSI install and uninstall `.cmd` templates (SYSTEM context, logging) |
+| **Intune/Zabbix-Agent2/** | Win32 package for Zabbix agent 2 with TLS PSK on AVD session hosts: install/uninstall `.cmd` (server and PSK identity as parameters), custom detection script |
+| **Intune/Remediation/** | Remediations script pairs: `TeamsMwi-Detect.ps1` / `TeamsMwi-Remediate.ps1` remove the classic Teams Machine-Wide Installer once new Teams is present |
+| **Intune/Test-AppInstallHealth.ps1** | Read-only post-update health test for a Win32 app: version, duplicate installs, uninstall entries, "Open with" verb, context-menu handler DLLs |
 
 ### Zabbix/
 
 Zabbix JSON-RPC helpers and reporting/alerting scripts: host and item selection, chunked trend export, web scenario and host availability evidence, port checks and web scenario alerting. See `Zabbix/README.md`.
+
+Also: monthly utilisation and uptime bundle collector with documented scoring rules (`Zabbix/report-rules.md`), business service tree builder, host tag merge, and a tenant-scoped read-only role for the service tree.
 
 ### On-Prem/
 
