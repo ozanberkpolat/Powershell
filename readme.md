@@ -47,6 +47,26 @@ New folders `Azure/Common/`, `Azure/Compute/`, `Azure/Monitoring/`, `Azure/Stora
 | `M365/Set-AppMailboxScope.ps1` | Exchange Online RBAC for Applications scoped to one mailbox |
 | `AVD/Register-SessionHost.ps1`, `AVD/Test-HybridJoin.ps1`, `AVD/README.md` | Session host re-registration, hybrid join diagnosis, AVD lessons and required endpoints |
 
+### Windows, Exchange, M365 and governance additions
+
+New top-level folders `Windows/` (in-guest scripts and Run Command orchestration for Windows VMs) and `Exchange-OnPrem/`, plus `Azure/Reporting/`. In-guest scripts run under Windows PowerShell 5.1 (locally or through `Azure/Compute/Invoke-VmRunCommand.ps1`), take string parameters and end with one `RESULT=` / `STATUS=` line. Everything that changes something is a dry run or `-WhatIf`-capable by default.
+
+| Path | Description |
+|------|-------------|
+| `M365/Connect-ExoSigned.psm1` | `Connect-ExchangeOnline` on App Control (WDAC) clients: signs the temporary tmpEXO module with a code-signing certificate (by subject or thumbprint) so it does not fall into Constrained Language Mode |
+| `M365/Send-AcsEmail.ps1` | Azure Communication Services Email over REST with an HMAC-signed request, no modules; key from a SecureString or `ACS_CONNECTION_STRING` |
+| `Windows/Get-InstalledSoftwareProbe.ps1` | Read-only software inventory via Run Command: machine, per-user and portable installs, MSI/EXE type, processes and Explorer-held shell extension DLLs |
+| `Windows/Update-AppViaRunCommand.ps1` | Fleet update of an EXE-installed app in waves: probe, defer or polite close, chunked delivery, install, 3-way post-install check (version, Open-with command, shell extension) |
+| `Windows/Extend-OsPartition.ps1` | In-guest assess / extend of C: after an Azure disk resize (GPT/MBR, Recovery partition after C:, rescan wait) |
+| `Exchange-OnPrem/Invoke-ExchangeGracefulShutdown.ps1` | Standalone Exchange: read-only check, graceful shutdown (drain, ServerWideOffline, dismount, eseutil clean check), resume and verify |
+| `Exchange-OnPrem/Test-ExchangeEndpoints.ps1` | OWA/ECP/EWS/MAPI/ActiveSync/Autodiscover evidence with native curl.exe, app pools, certificates, real client traffic from IIS logs |
+| `Azure/Tagging/Build-TaggingWorkbook.ps1` | Environment + Criticality classification workbook (XLSX) from Resource Graph for owners to confirm, with drop-downs and draft rules |
+| `Azure/Subscription-Management/New-LabParticipant.ps1` | Training lab: per-participant resource group, RG-scoped Contributor, built-in deny policies (VM sizes, resource types), budget alert |
+| `Azure/Subscription-Management/Remove-LabResources.ps1` | Ordered lab teardown: locks, role assignments (incl. PIM), backup vaults, diagnostic setting/workspace, policies/budgets, resource groups, custom roles |
+| `Azure/Networking/Get-PrivateEndpointConsumers.ps1` | Private endpoint subnets, endpoints, NSG rules, covering routes and Traffic Analytics consumers, with a verdict before enabling NSGs |
+| `AVD/Install-OfficeShared.ps1`, `AVD/office-shared-computer.xml` | Microsoft 365 Apps with shared computer activation via ODT: connectivity/TLS-inspection check, signed setup.exe, install and registry verification |
+| `Azure/Reporting/os-lifecycle.csv` | OS end-of-support dates (Windows Server 2012-2025, RHEL 7-10, Ubuntu LTS). RHEL: mainstream = end of Full Support, extended = end of Maintenance Support (ELS add-on not included). Ubuntu: mainstream = end of standard support, extended = end of ESM / Ubuntu Pro (month precision, last day of the month) |
+
 ### ITSM/
 
 | Folder | Description |
