@@ -84,3 +84,10 @@ More traps:
 - **Service access by tag includes child services**: tag the tenant's root service, not every leaf.
 - **A parent that was not created has no id**: in `-WhatIf` its children are listed as planned and never looked up as roots.
 - **Windows hosts have no `system.boottime`** and `system.uptime` keeps no trends: the availability script then takes reboots from the restart trigger, with a look-back before the period for the starting boot.
+
+## Agent helpers and templates
+
+| Path | What it is |
+|---|---|
+| `UserParameters/ibmmq/` | Zabbix Agent 2 `UserParameter` helper (bash, read-only `dspmq` / `runmqsc DISPLAY`): queue managers, local queue depth with the dead letter queue flagged, channel status, as JSON for low-level discovery. Fails loud instead of returning an empty list. See its `README.md` |
+| `Templates/` | Importable Zabbix 6.4+ templates that monitor Azure over REST with no agent: Logic App runs, Application Gateway backend health, Update Manager scheduled patching. Service principal or managed identity, secret macro empty in the files. See `Templates/README.md` |

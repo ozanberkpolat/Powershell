@@ -1,0 +1,522 @@
+zabbix_export:
+  version: '6.4'
+  template_groups:
+    - uuid: 0d5f6c613b8d429fb8ddb00b9219fa4f
+      name: Templates/Azure
+  templates:
+    - uuid: 073bd5d42391427b91f2db5170a58c1f
+      template: 'Azure Logic App Runs by HTTP'
+      name: 'Azure Logic App Runs by HTTP'
+      description: |
+        Monitors one Azure Logic App (Consumption, Microsoft.Logic/workflows) by HTTP through the ARM runs API. No agent, no external script.
+
+        Setup:
+          1. Create a service principal (or use the managed identity of the Azure VM that runs Zabbix, AZURE.AUTH.MODE=msi) and give it Reader on the Logic App or its resource group. Reader is enough to list runs.
+          2. Create one host per Logic App (no interface needed) and link this template.
+          3. On the HOST set AZURE.TENANT.ID, AZURE.APP.ID, AZURE.PASSWORD (secret) and AZURE.RESOURCE.ID = /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Logic/workflows/<name>.
+          4. Use Test on the Get data item and check the JSON and the Collector error item.
+
+        Standard (single tenant) Logic Apps are Microsoft.Web/sites and are not covered.
+      groups:
+        - name: Templates/Azure
+      items:
+        - uuid: 4425270513da4dc6aa3a190b0b6d4610
+          name: 'Azure Logic App: Get data'
+          type: SCRIPT
+          key: azure.logicapp.data.get
+          delay: 5m
+          history: '0'
+          value_type: TEXT
+          trends: '0'
+          params: |
+            // Shared auth block. Zabbix embedded JS is Duktape (ES5): no let/const, arrow functions or Array.prototype.find.
+            var P = JSON.parse(value);
+
+            function need(fields) {
+                for (var i = 0; i < fields.length; i++) {
+                    if (typeof P[fields[i]] === 'undefined' || P[fields[i]] === null || P[fields[i]] === '') {
+                        throw 'Required param is not set: ' + fields[i] + '.';
+                    }
+                }
+            }
+
+            function call(method, url, headers, body, useProxy) {
+                var r = new HttpRequest();
+                if (useProxy && P.proxy) { r.setProxy(P.proxy); }
+                for (var i = 0; i < headers.length; i++) { r.addHeader(headers[i]); }
+                var resp = (method === 'post') ? r.post(url, body) : r.get(url);
+                return { status: r.getStatus(), body: resp };
+            }
+
+            function login() {
+                var res, j;
+                if (P.auth_mode === 'msi') {
+                    // Managed identity of the Azure VM that runs Zabbix. IMDS is link-local: it must bypass the proxy.
+                    // app_id (optional) selects a user-assigned identity.
+                    res = call('get', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=' +
+                        encodeURIComponent('https://management.azure.com/') + (P.app_id ? '&client_id=' + encodeURIComponent(P.app_id) : ''),
+                        ['Metadata: true'], null, false);
+                    if (res.status !== 200) { throw 'Managed identity token request failed with status ' + res.status + ': ' + String(res.body).substring(0, 300); }
+                } else {
+                    need(['tenant_id', 'app_id', 'password']);
+                    res = call('post', 'https://login.microsoftonline.com/' + encodeURIComponent(P.tenant_id) + '/oauth2/v2.0/token',
+                        ['Content-Type: application/x-www-form-urlencoded'],
+                        'grant_type=client_credentials&client_id=' + encodeURIComponent(P.app_id) +
+                        '&client_secret=' + encodeURIComponent(P.password) +
+                        '&scope=' + encodeURIComponent('https://management.azure.com/.default'), true);
+                    if (res.status !== 200) { throw 'Login failed with status ' + res.status + ': ' + String(res.body).substring(0, 300); }
+                }
+                try { j = JSON.parse(res.body); } catch (e) { throw 'Failed to parse the login response.'; }
+                if (!j.access_token) { throw 'The login response does not contain an access token.'; }
+                return j.access_token;
+            }
+
+            function arm(token, url) {
+                // An empty or non-200 answer is an error, never "zero results".
+                var res = call('get', url, ['Content-Type: application/json', 'Authorization: Bearer ' + token], null, true);
+                if (res.status !== 200) { throw 'Request failed with status ' + res.status + ' for ' + url.split('?')[0] + ': ' + String(res.body).substring(0, 300); }
+                try { return JSON.parse(res.body); } catch (e) { throw 'Failed to parse the API response.'; }
+            }
+
+            // Logic App (Consumption, Microsoft.Logic/workflows) run status straight from the runs API.
+            // Azure Monitor metrics lag several minutes and miss the failing run's name and error code; the runs
+            // API is immediate, so alerting is built on it.
+            try {
+                need(['resource_id']);
+                var windowMin = Number(P.window_min) > 0 ? Number(P.window_min) : 15;
+                var token = login();
+                var base = 'https://management.azure.com' + P.resource_id;
+                var wf = arm(token, base + '?api-version=2019-05-01');
+                if (!wf.properties) { throw 'The workflow response has no properties.'; }
+
+                var since = new Date(Date.now() - windowMin * 60000).toISOString();
+                var url = base + '/runs?api-version=2019-05-01&$top=250&$filter=' + encodeURIComponent('startTime ge ' + since);
+                var runs = [], page = 0, truncated = 0;
+                while (url) {
+                    var r = arm(token, url);
+                    runs = runs.concat(r.value || []);
+                    url = r.nextLink || '';
+                    if (url && ++page >= 5) { truncated = 1; break; }   // 1250 runs per window is enough; flag it, never loop forever
+                }
+
+                var c = { total: 0, Succeeded: 0, Failed: 0, Cancelled: 0, TimedOut: 0, Running: 0, Other: 0 };
+                var lastFailed = null, lastFailedStart = '';
+                for (var i = 0; i < runs.length; i++) {
+                    var st = runs[i].properties.status, key = (typeof c[st] === 'number') ? st : (st === 'Waiting' ? 'Running' : 'Other');
+                    c[key]++; c.total++;
+                    if ((st === 'Failed' || st === 'TimedOut') && runs[i].properties.startTime > lastFailedStart) {
+                        lastFailedStart = runs[i].properties.startTime;
+                        lastFailed = runs[i].name + ' @ ' + lastFailedStart + (runs[i].properties.code ? ' (' + runs[i].properties.code + ')' : '');
+                    }
+                }
+
+                // Newest run overall (the list is newest first): "has it run at all lately" does not depend on the window.
+                var newest = arm(token, base + '/runs?api-version=2019-05-01&$top=1').value || [];
+                var ageSec = -1, lastStatus = 'None';
+                if (newest.length) {
+                    ageSec = Math.round((Date.now() - Date.parse(newest[0].properties.startTime)) / 1000);
+                    lastStatus = newest[0].properties.status;
+                }
+
+                return JSON.stringify({
+                    state: wf.properties.state, provisioning: wf.properties.provisioningState, version: wf.properties.version || '',
+                    window_min: windowMin, truncated: truncated,
+                    runs: { total: c.total, succeeded: c.Succeeded, failed: c.Failed, cancelled: c.Cancelled, timedout: c.TimedOut, running: c.Running, other: c.Other },
+                    failed_pct: c.total > 0 ? Math.round(1000 * (c.Failed + c.TimedOut) / c.total) / 10 : 0,
+                    last_failed: lastFailed || '', last_run_status: lastStatus, last_run_age_sec: ageSec
+                });
+            }
+            catch (error) {
+                error = String(error); error += (error.charAt(error.length - 1) === '.') ? '' : '.';
+                Zabbix.log(3, '[ AzureLogicApp ] ERROR: ' + error);
+                return JSON.stringify({ error: error });
+            }
+          description: 'Reads the workflow and its recent runs. Result is one JSON document for the dependent items.'
+          timeout: '{$AZURE.TIMEOUT}'
+          parameters:
+            - name: app_id
+              value: '{$AZURE.APP.ID}'
+            - name: auth_mode
+              value: '{$AZURE.AUTH.MODE}'
+            - name: password
+              value: '{$AZURE.PASSWORD}'
+            - name: proxy
+              value: '{$AZURE.PROXY}'
+            - name: resource_id
+              value: '{$AZURE.RESOURCE.ID}'
+            - name: tenant_id
+              value: '{$AZURE.TENANT.ID}'
+            - name: window_min
+              value: '{$AZURE.LOGICAPP.WINDOW}'
+          tags:
+            - tag: component
+              value: raw
+        - uuid: 95e861aecf3249ef9032093a675cbcfb
+          name: 'Azure Logic App: Collector error'
+          type: DEPENDENT
+          key: azure.logicapp.error
+          delay: '0'
+          history: 7d
+          value_type: TEXT
+          trends: '0'
+          description: 'Error text from the collector. Empty = fine. Typical: login failed (secret expired), 403 (no Reader on the Logic App), 404 (wrong resource ID).'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.error'
+              error_handler: CUSTOM_VALUE
+              error_handler_params: ''
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: raw
+          triggers:
+            - uuid: 0ddde102a67746cfabbf71b68dbd22f3
+              expression: 'length(last(/Azure Logic App Runs by HTTP/azure.logicapp.error))>0'
+              name: 'Azure Logic App: Collector reported an error'
+              opdata: '{ITEM.LASTVALUE1}'
+              priority: AVERAGE
+              description: 'The collector could not read the workflow, so every other trigger of this template is blind. Read the item value.'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 7904d01ebe844724a65bdfb9bb0db151
+          name: 'Azure Logic App: Workflow state'
+          type: DEPENDENT
+          key: azure.logicapp.state
+          delay: '0'
+          history: 7d
+          value_type: CHAR
+          trends: '0'
+          description: 'Enabled or Disabled.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.state'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: state
+          triggers:
+            - uuid: d98b583436d843e2bc8dd27750615fdb
+              expression: 'last(/Azure Logic App Runs by HTTP/azure.logicapp.state)<>"Enabled"'
+              name: 'Azure Logic App: Workflow is not enabled (state: {ITEM.LASTVALUE1})'
+              priority: HIGH
+              description: 'A disabled Logic App stops triggering silently. Re-enable it, or remove the host if the retirement is intended.'
+              dependencies:
+                - name: 'Azure Logic App: Collector reported an error'
+                  expression: 'length(last(/Azure Logic App Runs by HTTP/azure.logicapp.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 357c735aa1f3423cb6aaf6a4d135c355
+          name: 'Azure Logic App: Provisioning state'
+          type: DEPENDENT
+          key: azure.logicapp.provisioning
+          delay: '0'
+          history: 7d
+          value_type: CHAR
+          trends: '0'
+          description: 'ARM provisioning state, normally Succeeded.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.provisioning'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: state
+          triggers:
+            - uuid: 28b490b7a4414710b11cbe0219444a08
+              expression: 'last(/Azure Logic App Runs by HTTP/azure.logicapp.provisioning)<>"Succeeded"'
+              name: 'Azure Logic App: Provisioning state is not Succeeded (state: {ITEM.LASTVALUE1})'
+              priority: WARNING
+              description: 'The last deployment of the workflow did not finish cleanly.'
+              dependencies:
+                - name: 'Azure Logic App: Collector reported an error'
+                  expression: 'length(last(/Azure Logic App Runs by HTTP/azure.logicapp.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 06ac9c4f85874ddcbc526890f2d6d8ed
+          name: 'Azure Logic App: Failed runs in window'
+          type: DEPENDENT
+          key: azure.logicapp.runs.failed
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: 'Runs with status Failed that started inside the window (macro AZURE.LOGICAPP.WINDOW).'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.runs.failed'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+          triggers:
+            - uuid: 670c16dbb5b0440c9e5549b3ec130fe7
+              expression: 'last(/Azure Logic App Runs by HTTP/azure.logicapp.runs.failed)>{$AZURE.LOGICAPP.RUNS.FAILED.MAX}'
+              name: 'Azure Logic App: Failed runs detected'
+              opdata: 'Failed: {ITEM.LASTVALUE1}'
+              priority: HIGH
+              description: 'At least one run failed inside the window. The Last failed run item holds the run name, start time and error code. The problem resolves by itself once the failing run leaves the window.'
+              dependencies:
+                - name: 'Azure Logic App: Collector reported an error'
+                  expression: 'length(last(/Azure Logic App Runs by HTTP/azure.logicapp.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 9bd2838cc2bc48d4a7aeb081cc010c63
+          name: 'Azure Logic App: Timed out runs in window'
+          type: DEPENDENT
+          key: azure.logicapp.runs.timedout
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: 'Runs with status TimedOut. Counted as failures in the failure percentage.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.runs.timedout'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+        - uuid: 9500663873a7469c8260fd19743ae61e
+          name: 'Azure Logic App: Succeeded runs in window'
+          type: DEPENDENT
+          key: azure.logicapp.runs.succeeded
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: 'Runs with status Succeeded.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.runs.succeeded'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+        - uuid: eb114351112b4759b907c27fee4b5a97
+          name: 'Azure Logic App: Cancelled runs in window'
+          type: DEPENDENT
+          key: azure.logicapp.runs.cancelled
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: 'Runs with status Cancelled.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.runs.cancelled'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+        - uuid: d0ec216387cb422096ccc24b82b48a5a
+          name: 'Azure Logic App: Running or waiting runs'
+          type: DEPENDENT
+          key: azure.logicapp.runs.running
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: 'Runs with status Running or Waiting.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.runs.running'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+        - uuid: 1d80aca612d74f1390393e6fd8dc7779
+          name: 'Azure Logic App: Runs in window'
+          type: DEPENDENT
+          key: azure.logicapp.runs.total
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: 'All runs that started inside the window.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.runs.total'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+        - uuid: 3241335565854b7fa1fdb33f67f0e496
+          name: 'Azure Logic App: Failure percentage'
+          type: DEPENDENT
+          key: azure.logicapp.runs.failed.pct
+          delay: '0'
+          history: 7d
+          value_type: FLOAT
+          units: '%'
+          description: 'Failed plus timed out runs as a percentage of all runs in the window. 0 when there were no runs.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.failed_pct'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+          triggers:
+            - uuid: e759068f3c6d42fd8ed76d800c6cf1bf
+              expression: 'last(/Azure Logic App Runs by HTTP/azure.logicapp.runs.failed.pct)>{$AZURE.LOGICAPP.RUNS.FAILURE.PCT.CRIT} and last(/Azure Logic App Runs by HTTP/azure.logicapp.runs.total)>=3'
+              name: 'Azure Logic App: High run failure percentage'
+              opdata: '{ITEM.LASTVALUE1}%'
+              priority: HIGH
+              description: 'More than the allowed share of runs failed (needs at least 3 runs in the window so one failure of one run does not read as 100 percent).'
+              dependencies:
+                - name: 'Azure Logic App: Collector reported an error'
+                  expression: 'length(last(/Azure Logic App Runs by HTTP/azure.logicapp.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 2d62fe61490242c6aaadc4fa33cc613e
+          name: 'Azure Logic App: Last failed run'
+          type: DEPENDENT
+          key: azure.logicapp.runs.last.failed
+          delay: '0'
+          history: 7d
+          value_type: CHAR
+          trends: '0'
+          description: 'Run name, start time and error code of the newest failed run in the window. Empty when none.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.last_failed'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+        - uuid: 45d42e322cbd434481fe9b858364cea5
+          name: 'Azure Logic App: Last run status'
+          type: DEPENDENT
+          key: azure.logicapp.runs.last.status
+          delay: '0'
+          history: 7d
+          value_type: CHAR
+          trends: '0'
+          description: 'Status of the newest run overall, regardless of the window. None = the workflow never ran.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.last_run_status'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+        - uuid: 9d05ced2ae0d4fa78e74aa17d257cf2c
+          name: 'Azure Logic App: Seconds since last run'
+          type: DEPENDENT
+          key: azure.logicapp.runs.last.age
+          delay: '0'
+          history: 7d
+          value_type: FLOAT
+          units: 's'
+          description: 'Age of the newest run in seconds. -1 = the workflow never ran.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.last_run_age_sec'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: runs
+          triggers:
+            - uuid: a60741e3ba6e48c98681947d16887013
+              expression: '{$AZURE.LOGICAPP.IDLE.MAX}>0 and (last(/Azure Logic App Runs by HTTP/azure.logicapp.runs.last.age)>{$AZURE.LOGICAPP.IDLE.MAX} or last(/Azure Logic App Runs by HTTP/azure.logicapp.runs.last.age)=-1)'
+              name: 'Azure Logic App: No run for too long'
+              priority: AVERAGE
+              description: 'A schedule or webhook workflow that should run regularly has not started a run within AZURE.LOGICAPP.IDLE.MAX seconds. Disabled by default (macro 0).'
+              dependencies:
+                - name: 'Azure Logic App: Collector reported an error'
+                  expression: 'length(last(/Azure Logic App Runs by HTTP/azure.logicapp.error))>0'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: c677e7ef265a4c6b886028bb5c4002bd
+          name: 'Azure Logic App: Run list truncated'
+          type: DEPENDENT
+          key: azure.logicapp.runs.truncated
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          description: '1 when the window held more than 1250 runs and the counts are a lower bound. Shorten AZURE.LOGICAPP.WINDOW.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.truncated'
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.logicapp.data.get
+          tags:
+            - tag: component
+              value: raw
+      tags:
+        - tag: class
+          value: cloud
+        - tag: target
+          value: azure
+        - tag: target
+          value: logic-app
+      macros:
+        - macro: '{$AZURE.APP.ID}'
+          description: 'Application (client) ID of the service principal, or of a user-assigned managed identity when AUTH.MODE is msi. Set it on the HOST.'
+        - macro: '{$AZURE.AUTH.MODE}'
+          value: 'sp'
+          description: '"sp" = service principal (tenant, app id, secret). "msi" = managed identity of the Azure VM that runs the Zabbix server (tenant and secret stay empty).'
+        - macro: '{$AZURE.PASSWORD}'
+          type: SECRET_TEXT
+          description: 'Client secret of the service principal. Set it on the HOST, never on the template: a re-import with Update existing resets template-level macro values to the empty value in this file.'
+        - macro: '{$AZURE.PROXY}'
+          description: 'HTTP proxy for the Azure calls. Leave empty if not needed. Ignored for the managed identity endpoint.'
+        - macro: '{$AZURE.RESOURCE.ID}'
+          description: 'Full ARM resource ID of the monitored resource (see the template description). Set it per HOST.'
+        - macro: '{$AZURE.TENANT.ID}'
+          description: 'Entra ID tenant (directory) ID. Set it on the HOST.'
+        - macro: '{$AZURE.TIMEOUT}'
+          value: '30s'
+          description: 'Timeout of the collector script item.'
+        - macro: '{$AZURE.LOGICAPP.WINDOW}'
+          value: '15'
+          description: 'Minutes of run history to count. Keep it at least 2x the item interval (5m) so a run is never missed between polls.'
+        - macro: '{$AZURE.LOGICAPP.RUNS.FAILED.MAX}'
+          value: '0'
+          description: 'Failed runs in the window above which the trigger fires.'
+        - macro: '{$AZURE.LOGICAPP.RUNS.FAILURE.PCT.CRIT}'
+          value: '20'
+          description: 'Failure percentage above which the trigger fires.'
+        - macro: '{$AZURE.LOGICAPP.IDLE.MAX}'
+          value: '0'
+          description: 'Seconds without a new run before the idle trigger fires. 0 disables it.'
